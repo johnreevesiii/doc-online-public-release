@@ -1,0 +1,107 @@
+{
+  "files": {
+    "ARCHITECTURE.md": {
+      "from": "docs (written for the public release)",
+      "sha256": "4764ee24cb3364d35d9f2e466c055e48759e25cb05f90779486a43bc8d1c4185"
+    },
+    "HOSTING.md": {
+      "from": "docs (written for the public release)",
+      "sha256": "45eec50c6b8fa676d5d91bcf4d8ed1d952cf701869a0f99527a0ccec55454ea5"
+    },
+    "README.md": {
+      "from": "docs (written for the public release)",
+      "sha256": "80f20cf0ac5bafdfab8aa9e53b5dec7d8f96ba0d706ce6725d32239a28f84275"
+    },
+    "toolkit/board-config/main/emu.cfg": {
+      "from": "doc-stream:homepack/v3/main/emu.cfg",
+      "sha256": "cab5f84c80f02fc5218bbdb02caedd0b1ed4086870ce37b8f72876098820091f"
+    },
+    "toolkit/board-config/sat1/emu.cfg": {
+      "from": "doc-stream:homepack/v3/sat1/emu.cfg",
+      "sha256": "6076eb501c65130d501dec12f19db7017a6f5acd457a0ee7ee6148a81ab5a2b6"
+    },
+    "toolkit/doc-host-app/DocHost.cs": {
+      "from": "doc-stream:hostapp/app/DocHost.cs",
+      "sha256": "a55117fda432168dc9726f0352e7ab16d3a5e53a3fbd26c4e9bed933dcbe8163"
+    },
+    "toolkit/doc-host-app/DocHostActions.ps1": {
+      "from": "doc-stream:hostapp/scripts/DocHostActions.ps1",
+      "sha256": "6ef1b054b36c43502d492acfabe50b5f2320c64291c332df500da31e63ee7a45"
+    },
+    "toolkit/doc-host-app/DocHostCommon.ps1": {
+      "edited": "1 named replacement(s), see allowlist.json",
+      "from": "doc-stream:hostapp/scripts/DocHostCommon.ps1",
+      "sha256": "e48ec8fa05a3e7099b4662cc0031b5643851d7c390e11de38d7facfea10679de",
+      "source_sha256": "58d939b56cb8be05be84037a3c1c0628e8d9ce3a956a238e70691942aa8da305"
+    },
+    "toolkit/doc-host-app/DocHostInstall.ps1": {
+      "from": "doc-stream:hostapp/scripts/DocHostInstall.ps1",
+      "sha256": "83581ac5908a70df0a2321f67af37829df0c233c5365929d2d92605eb444dc5d"
+    },
+    "toolkit/doc-host-app/DocHostRecover.ps1": {
+      "from": "doc-stream:hostapp/scripts/DocHostRecover.ps1",
+      "sha256": "00e2ac135ed2ae0d0c8180cd92653c49877fefd18dfd8172c3e6aa08295bd7f5"
+    },
+    "toolkit/doc-host-app/Install DOC Host.txt": {
+      "from": "doc-stream:hostapp/Install DOC Host.txt",
+      "sha256": "55d28ea7941cfc6000eb2fd7927f2df22733853afc43259c911612893be8a8cd"
+    },
+    "toolkit/host-pack/Host Console.cmd": {
+      "from": "doc-stream:homepack/v3/Host Console.cmd",
+      "sha256": "4a051ac9608fd8b1b311ffe2a7f5e7f77b14f3d11d8ca6f0c6450066d4f3e9d5"
+    },
+    "toolkit/host-pack/README - START HERE.txt": {
+      "from": "doc-stream:homepack/v3/README - START HERE.txt",
+      "sha256": "ad2b6616729eb50f6f6435ef4d1af4c9f37590405d1686c2c2428c9b6b05c505"
+    },
+    "toolkit/host-pack/VERSION": {
+      "from": "doc-stream:homepack/v3/VERSION",
+      "sha256": "b2f44d3b6e29f8b1b73ea4735f006affc4d198e1fd9c7d50e736159b1ef636c6"
+    },
+    "toolkit/host-pack/_launch.ps1": {
+      "from": "doc-stream:homepack/v3/_launch.ps1",
+      "sha256": "b95ea0a207749ffeea0fc05a9a98f78e6447a6613775848b8a57247402cc8fbf"
+    },
+    "toolkit/host-pack/cabinet-doctor.ps1": {
+      "from": "doc-stream:cabinet-doctor.ps1",
+      "sha256": "7fbf070ffa281f77ea2bc2b85da307d7ef2e95a0badfdd75bd7d793e8bf6349c"
+    },
+    "toolkit/host-pack/setup/RebalanceBoot.ps1": {
+      "from": "doc-stream:homepack/v3/setup/RebalanceBoot.ps1",
+      "sha256": "72c30fc10eb03eca83b45faf118968c7e861c41dd961b6abd1581d27f8cf4a5e"
+    },
+    "toolkit/host-pack/setup/RestartGame.ps1": {
+      "from": "doc-stream:homepack/v3/setup/RestartGame.ps1",
+      "sha256": "ba9bd5b48630131fc69debfb0e3506e8e02704a80b63476b4a885b7a47bd5cf2"
+    },
+    "toolkit/host-pack/setup/Setup.ps1": {
+      "from": "doc-stream:homepack/v3/setup/Setup.ps1",
+      "sha256": "d52bc4d271823b9fb3a25b64447845d029eff654318e03605077680929cff6c3"
+    },
+    "toolkit/host-pack/slot_station.py": {
+      "from": "doc-stream:homepack/v3/slot_station.py",
+      "sha256": "42a443a8d4b933c08cb6685a48f0354202eb9fcf2e389ac5d1ad9ba87bd2752a"
+    },
+    "toolkit/streaming/audio_relay_push.py": {
+      "from": "doc-stream:homepack/v3/audio_relay_push.py",
+      "sha256": "dca5260c6d206a1f5b9fc4b2313195ae17bb46f0fa313e5df811561a59bde53e"
+    },
+    "toolkit/streaming/broadcast-wgc.ps1": {
+      "from": "doc-stream:homepack/v3/broadcast-wgc.ps1",
+      "sha256": "57f0ff869eefef672829f768a130ef730e2c417b0b10a023cfde19f6ee6b638e"
+    },
+    "toolkit/streaming/mains_combine.py": {
+      "from": "doc-stream:homepack/v3/mains_combine.py",
+      "sha256": "5f7b048b1a973d4f23798944e618931d1e9d6db9cdddb7f4a7299a5222ee5215"
+    },
+    "toolkit/streaming/wgc_relay_push.py": {
+      "from": "doc-stream:homepack/v3/wgc_relay_push.py",
+      "sha256": "0cb0ae7f383d7add4b775494a7d18162faa01e5a6e7872a853f1cf3a2957e974"
+    }
+  },
+  "sources": {
+    "doc-stream": {
+      "commit": "33a7d49e108df51976f3a43482d057c280cb0b5e"
+    }
+  }
+}

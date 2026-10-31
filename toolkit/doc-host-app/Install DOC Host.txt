@@ -1,0 +1,107 @@
+INSTALL DOC HOST
+================
+
+DOC Host turns this PC into a Derby Owners Club cabinet that players join from the lobby at
+play.johnreevesiii.com. It replaces the Host Pack zip and its folder of scripts with one program
+and one window.
+
+You need: Windows 10 or 11 (64-bit), about 2 GB of free disk space, a real graphics card, and a
+Derby Owners Club account. 16 GB of memory is comfortable for 8 seats.
+
+
+1. DOWNLOAD
+-----------
+Sign in at play.johnreevesiii.com and download DOC-Host-Setup-<version>.exe from the host page.
+The download is only offered to signed-in hosts.
+
+
+2. RUN THE SETUP (and the blue Windows warning)
+-----------------------------------------------
+Double-click DOC-Host-Setup-<version>.exe.
+
+This first version is not signed with a code-signing certificate yet, so Windows shows a blue box
+that says "Windows protected your PC". That is expected:
+  a. Click "More info".
+  b. Check that the file name is DOC-Host-Setup-<version>.exe.
+  c. Click "Run anyway".
+If your browser says the file "is not commonly downloaded", choose Keep (in Edge: the three dots,
+then Keep, then Keep anyway).
+
+Setup does not ask for an administrator password.
+
+
+3. ANSWER THE SETUP QUESTIONS
+-----------------------------
+- Install folder: keep the suggested one (in your user's Programs folder). Do not pick a OneDrive,
+  Google Drive or Dropbox folder. If you choose a folder outside your user folder (for example
+  C:\DOC Host), DOC Host locks it so only your Windows account can open it.
+- Moving from a Host Pack folder? If you host today with an extracted Host Pack, first press
+  Stop Hosting in that old folder when nobody is seated. Then choose that folder here. DOC Host
+  copies your pairing over, so you do not pair again. The old folder is not changed or deleted,
+  so it stays your way back. New hosts leave this box empty.
+- Desktop icon: tick it if you want one.
+Click Install. Copying takes a minute or two.
+
+
+4. FIRST START
+--------------
+Open DOC Host (desktop or Start menu).
+  1. Sign in: press "Sign in and pair this PC". Your browser opens; sign in and approve the
+     cabinet. (Skip this if you moved over from a Host Pack folder: it says Paired.)
+  2. Pick the game and the number of seats. Tick "I will play at this PC too" if you want seat 1
+     for yourself.
+  3. On the website (Stable, Host section) set your cabinet's game version to the same game.
+     DOC Host reminds you if they differ.
+  4. Press Start hosting. Wait for the lights: Card broker, Game, Seat stations, Lobby link and
+     Video should go green within about two minutes.
+
+The lights
+  green  working          amber  needs a minute or a look          red  not working          grey  off
+
+The buttons
+  Start hosting      starts everything (also applies a new game or seat count)
+  Stop hosting       takes this PC off the lobby. Pairing is kept.
+  Fix picture        board cropped, black or seamed. Does not restart the game.
+  Restart game       restarts the game windows (anyone mid-race loses that race)
+  Doctor             a full health report in the window
+  Host Console       play at this PC with your own horses
+  Open logs          the log folder, for the operator
+  Advanced           the Host Pack's own scripts, for support only
+
+"Let remote players restart and fix screens" (on by default) lets players use the lobby's Restart
+and Refresh screens buttons for your cabinet. DOC Host refuses a Restart while you hold a seat at
+this PC or while a horse is being saved; Refresh screens still works then. Untick it to turn it off
+(the lobby then stops offering the buttons for your cabinet).
+
+
+5. UPGRADE
+----------
+When a new version comes out:
+  1. Press Stop hosting in DOC Host when nobody is seated.
+  2. Close DOC Host.
+  3. Run the new DOC-Host-Setup-<version>.exe (same "More info, Run anyway" step).
+It installs over the old version in the same folder. Your pairing, settings, logs and any unsaved
+horses are kept. Open DOC Host and press Start hosting.
+If setup says DOC Host is hosting right now, do step 1 first.
+
+
+6. UNINSTALL
+------------
+Windows Settings, Apps, DOC Host, Uninstall (or Start menu, DOC Host, Uninstall DOC Host).
+Uninstalling stops hosting on this PC. It then asks:
+  - If DOC Host took over the hosting tasks of an older pack folder, whether to put them back.
+    Choose Yes if you want to host from that old folder again.
+  - "Also delete your DOC Host data?" Choose No (the default) to keep your pairing copy, settings
+    and logs, so a reinstall stays paired.
+  - If you chose Yes and there are horses that never reached the website (pending saves), it asks
+    a second time. Choose No to keep them for the operator.
+Your data folder is %LOCALAPPDATA%\DOC Host\data (paste that into File Explorer's address bar).
+Only your Windows account can open it.
+
+
+IF SOMETHING IS WRONG
+---------------------
+Press Doctor and read the last lines. Press Open logs and send the operator the newest files.
+Your data folder holds your cabinet's private token. DOC Host locks it to your Windows account;
+do not copy it to a shared place. If an older DOC Host left a folder C:\ProgramData\DOC Host, the new
+one copies what it needs and tells you; you can delete the old folder afterwards.
