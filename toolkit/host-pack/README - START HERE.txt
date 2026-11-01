@@ -1,4 +1,4 @@
-DERBY OWNERS CLUB - HOST PACK V3 (3.1.0)
+DERBY OWNERS CLUB - HOST PACK V3 (3.2.0)
 
 START HERE
 ----------
@@ -13,16 +13,29 @@ START HERE
    (for example 8 seats, option 6 Rev C Rebalance) and Yes to start now.
 
 Always update by extracting the whole pack. Do not copy single files from this
-zip over an older install: 3.1.0 changes the broker, the seat stations, Setup
-and every board's settings file, and a partial copy misses some of them.
+zip over an older install: 3.2.0 changes the broker and the relay agent, 3.1.0
+changed the seat stations, Setup and every board's settings file, and a partial
+copy misses some of them.
 
 Rebalance automatically starts Main plus sat1 through sat8. Main has a separate
 display child, so eight seats requires ten Flycast processes. Setup and Restart
 Game wait up to 75 seconds for the full set and report incomplete startup.
 Signed Microsoft x64 CRT/OpenMP runtimes and the loopback network fix are included.
 
-WHAT IS NEW IN 3.1.0
+WHAT IS NEW IN 3.2.0
 --------------------
+- DOC Host updates itself: it checks for a new release, and installs it when
+  nobody is playing or when you press Update now. Your pairing, saved horses and
+  logs are kept, and an update that fails is undone.
+- The box tells the website which game it is running, so players are always
+  offered the game this PC really runs. If you pick a different game on the
+  website, DOC Host offers it at your next Start. Nothing restarts by itself.
+- Safer seat sign-in: a seated player's browser now uses a seat token that works
+  only for this cabinet. A player's account sign-in never reaches this PC.
+- One cabinet per account: pairing a PC again moves your cabinet to it.
+
+WHAT WAS NEW IN 3.1.0
+---------------------
 - Host Console is back: play at THIS PC with your own online horses (below).
 - No card tools in the pack: the Station Managers, the card editor, the shared
   card shelf and the card vault are gone. Card editing is done by the operator
@@ -89,5 +102,6 @@ integrity are verified for each build. Each host PC's own hardware and a live
 eight-player race remain to be tested. No claim of career balance. Setting the
 machine to Rebalance alone does not update the website's game-version selector.
 
-Version 3.1.0 (3.0.0 plus the Host Console, doc-ops #111, and the #117 pack
-containment). Personal testing pack. Prior packs are preserved.
+Version 3.2.0 (3.1.0 plus the in-app updater, the game report to the website
+and cabinet-only seat tokens; 3.1.0 was 3.0.0 plus the Host Console, doc-ops
+#111, and the #117 pack containment). Personal testing pack. Prior packs are preserved.

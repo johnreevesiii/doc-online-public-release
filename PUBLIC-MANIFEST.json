@@ -22,29 +22,29 @@
     },
     "toolkit/doc-host-app/DocHost.cs": {
       "from": "doc-stream:hostapp/app/DocHost.cs",
-      "sha256": "a55117fda432168dc9726f0352e7ab16d3a5e53a3fbd26c4e9bed933dcbe8163"
+      "sha256": "831c4247402726929c7de813b15d7969883194fece63aaaf86270015a712ddff"
     },
     "toolkit/doc-host-app/DocHostActions.ps1": {
       "from": "doc-stream:hostapp/scripts/DocHostActions.ps1",
-      "sha256": "6ef1b054b36c43502d492acfabe50b5f2320c64291c332df500da31e63ee7a45"
+      "sha256": "211ba86a7de371bca84620f79a0b7f04c336dc675f754fcc5504a62ec16bbd26"
     },
     "toolkit/doc-host-app/DocHostCommon.ps1": {
       "edited": "1 named replacement(s), see allowlist.json",
       "from": "doc-stream:hostapp/scripts/DocHostCommon.ps1",
-      "sha256": "e48ec8fa05a3e7099b4662cc0031b5643851d7c390e11de38d7facfea10679de",
-      "source_sha256": "58d939b56cb8be05be84037a3c1c0628e8d9ce3a956a238e70691942aa8da305"
+      "sha256": "a0acb6f8831eff1a45d2c125bb7de6b1531955380efa36818231e7b8c4cd4fe3",
+      "source_sha256": "8aa35ea7d3990f4a6e7bbb2ec83a11588d48ad13563548b65eac7009482abd28"
     },
     "toolkit/doc-host-app/DocHostInstall.ps1": {
       "from": "doc-stream:hostapp/scripts/DocHostInstall.ps1",
-      "sha256": "83581ac5908a70df0a2321f67af37829df0c233c5365929d2d92605eb444dc5d"
+      "sha256": "cb8eb03c17d50a690c4a477857867da8b1bbf7031c0a338fbb585f6d8e6171e3"
     },
     "toolkit/doc-host-app/DocHostRecover.ps1": {
       "from": "doc-stream:hostapp/scripts/DocHostRecover.ps1",
-      "sha256": "00e2ac135ed2ae0d0c8180cd92653c49877fefd18dfd8172c3e6aa08295bd7f5"
+      "sha256": "a0a01903390fc0650ac581bbd2b99a82737d20d4b32afb34f784b3310bff9739"
     },
     "toolkit/doc-host-app/Install DOC Host.txt": {
       "from": "doc-stream:hostapp/Install DOC Host.txt",
-      "sha256": "55d28ea7941cfc6000eb2fd7927f2df22733853afc43259c911612893be8a8cd"
+      "sha256": "6b0cace70ee4e16139769a072e427dcb78c683e25b2e75c91d7331ae0f307e08"
     },
     "toolkit/host-pack/Host Console.cmd": {
       "from": "doc-stream:homepack/v3/Host Console.cmd",
@@ -52,11 +52,11 @@
     },
     "toolkit/host-pack/README - START HERE.txt": {
       "from": "doc-stream:homepack/v3/README - START HERE.txt",
-      "sha256": "ad2b6616729eb50f6f6435ef4d1af4c9f37590405d1686c2c2428c9b6b05c505"
+      "sha256": "0120a47c02bfffe0f127ea43e016e5fb5a94fb76e1bf96c63fc0c578ed62eef6"
     },
     "toolkit/host-pack/VERSION": {
       "from": "doc-stream:homepack/v3/VERSION",
-      "sha256": "b2f44d3b6e29f8b1b73ea4735f006affc4d198e1fd9c7d50e736159b1ef636c6"
+      "sha256": "33bdaf9e2d6bcbde2e4e613e865e403f8fe21fc621078d34c30b0bdc7f68d903"
     },
     "toolkit/host-pack/_launch.ps1": {
       "from": "doc-stream:homepack/v3/_launch.ps1",
@@ -101,7 +101,7 @@
   },
   "sources": {
     "doc-stream": {
-      "commit": "33a7d49e108df51976f3a43482d057c280cb0b5e"
+      "commit": "3cbe6b984b17c486383d5890c756992eb51bc297"
     }
   }
 }

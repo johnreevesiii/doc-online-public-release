@@ -42,16 +42,35 @@ function Get-DhLongPath([string]$p) {
 }
 
 # Write a small state file through a .tmp and a File.Replace/Move, never Move-Item (8.3-safe).
+# The .tmp is written through to the disk before it takes the real name (review of PR #45 round 12: a rename can
+# reach the disk before the data it names, so after a power cut a marker could read as zeros and an interrupted
+# update would go unnoticed).
 function Write-DhFileAtomic([string]$path, [string]$text) {
   $tmp = $path + '.tmp'
-  [IO.File]::WriteAllText($tmp, $text, (New-Object Text.UTF8Encoding($false)))
+  $b = (New-Object Text.UTF8Encoding($false)).GetBytes($text)
+  $fs = New-Object IO.FileStream($tmp, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+  try { $fs.Write($b, 0, $b.Length); $fs.Flush($true) } finally { $fs.Dispose() }
   # [NullString]::Value, not $null: PowerShell would pass $null as "" and File.Replace rejects an empty backup name.
   if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp, $path, [NullString]::Value) } else { [IO.File]::Move($tmp, $path) }
 }
 
-$script:DH_SCRIPTS = Get-DhLongPath $PSScriptRoot
+# DH_CODE is where these scripts run from; DH_SCRIPTS is always the install's own hostapp folder. They differ only
+# for the frozen recovery copy an update saves before its first swap (<data>\updates\recovery\<attempt>\hostapp,
+# DocHostUpdate.ps1 Save-DhRecoveryKit): its recovery-app.txt names the install it belongs to, so the undo of an
+# interrupted update runs the code that wrote the journal, never a mix of old and new scripts (review of PR #45).
+$script:DH_CODE = Get-DhLongPath $PSScriptRoot
+$script:DH_KIT = $false
+$kitApp = Join-Path $PSScriptRoot 'recovery-app.txt'
+if (Test-Path -LiteralPath $kitApp -PathType Leaf) {
+  $ka = ([IO.File]::ReadAllText($kitApp)).Trim()
+  if (-not $ka -or -not [IO.Path]::IsPathRooted($ka) -or -not (Test-Path -LiteralPath (Join-Path $ka 'hostapp') -PathType Container)) {
+    throw "the recovery copy does not name a DOC Host install: $ka"
+  }
+  $script:DH_KIT = $true
+  $script:DH_SCRIPTS = Get-DhLongPath (Join-Path $ka 'hostapp')
+} else { $script:DH_SCRIPTS = $script:DH_CODE }
 $script:DH_APP     = Split-Path -Parent $script:DH_SCRIPTS
-$script:DH_RELEASE = Test-Path -LiteralPath (Join-Path $PSScriptRoot 'RELEASE')
+$script:DH_RELEASE = Test-Path -LiteralPath (Join-Path $script:DH_SCRIPTS 'RELEASE')
 $script:DH_SANDBOX = ($env:DOCHOST_SANDBOX -eq '1') -and -not $script:DH_RELEASE
 $script:DH_PACK    = Join-Path $script:DH_APP 'pack'
 if ($script:DH_SANDBOX -and $env:DOCHOST_PACK) { $script:DH_PACK = $env:DOCHOST_PACK }
@@ -75,10 +94,83 @@ $script:DH_LOGS = Join-Path $script:DH_DATA 'logs'
 $script:DH_LEGACY_DATA = Join-Path $env:ProgramData 'DOC Host'
 if ($script:DH_SANDBOX -and $env:DOCHOST_LEGACY_DATA) { $script:DH_LEGACY_DATA = $env:DOCHOST_LEGACY_DATA }
 
-# The pack's own helpers (games, cabinet.json, tasks, borderless, priorities).
+# The pack's own helpers (games, cabinet.json, tasks, borderless, priorities). The recovery copy brings the
+# pack's Common.ps1 of the version that wrote the journal too (the live one may already be the new release's);
+# it is used only when none of its code depends on where it sits, otherwise the install's own is loaded over it.
 $packCommon = Join-Path $script:DH_PACK 'setup\Common.ps1'
 if (-not (Test-Path -LiteralPath $packCommon)) { throw "Host Pack not found at $($script:DH_PACK)" }
-. $packCommon
+$kitPackCommon = Join-Path (Split-Path -Parent $script:DH_CODE) 'pack\setup\Common.ps1'
+$script:DH_PACKCOMMON_FROM = 'install'
+if ($script:DH_KIT -and (Test-Path -LiteralPath $kitPackCommon -PathType Leaf)) {
+  # First, a check of the whole file as code (round 17 and 20 reviews): the copy's Common.ps1 is loaded only when
+  # it uses where it sits ($PSScriptRoot, ${PSScriptRoot}, $script:PSScriptRoot, $PSCommandPath, $MyInvocation,
+  # comments aside) nowhere but inside Get-PackRoot, the pack's own "where am I" helper, which is replaced below
+  # by one that answers this install's pack folder. Anything else, or a file that does not parse: not loaded.
+  $selfDep = 0
+  try {
+    $__dhgErr = $null
+    $__dhgAst = [Management.Automation.Language.Parser]::ParseFile($kitPackCommon, [ref]$null, [ref]$__dhgErr)
+    if ($__dhgErr) { $selfDep = 1 }
+    else {
+      $__dhgL = [Management.Automation.Language.FunctionDefinitionAst]
+      $__dhgInGpr = { param($n) $q = $n.Parent; while ($q -and $q -isnot $__dhgL) { $q = $q.Parent }; ($q -and $q.Name -eq 'Get-PackRoot') }
+      # at most one Get-PackRoot, defined at the top of the file (never nested inside another function)
+      $__dhgDefs = @($__dhgAst.FindAll({ param($n) $n -is $__dhgL -and $n.Name -match '^(?i)([a-z]+:)?Get-PackRoot$' }, $true))
+      if ($__dhgDefs.Count -gt 1 -or ($__dhgDefs.Count -eq 1 -and $__dhgDefs[0].Parent -ne $__dhgAst.EndBlock)) { $selfDep = 1 }
+      # "where am I" in any form (any scope prefix; Get-Variable/call-stack/script-block lookups by name) only
+      # inside Get-PackRoot, and no script block there that could carry it elsewhere
+      foreach ($__dhgU in @($__dhgAst.FindAll({ param($n)
+            ($n -is [Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -match '^(?i)([a-z]+:)?(PSScriptRoot|PSCommandPath|MyInvocation|ExecutionContext|PSCmdlet)$') -or
+            ($n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -match '(?i)PSScriptRoot|PSCommandPath|MyInvocation|PSCallStack|ScriptBlock|^function:') }, $true))) {
+        if (-not (& $__dhgInGpr $__dhgU)) { $selfDep = 1 }
+      }
+      foreach ($__dhgB in @($__dhgAst.FindAll({ param($n) $n -is [Management.Automation.Language.ScriptBlockExpressionAst] }, $true))) {
+        if (& $__dhgInGpr $__dhgB) { $selfDep = 1 }
+      }
+      # Get-PackRoot is never called while the file loads (it would act on the copy's folder before the replacement)
+      foreach ($__dhgC in @($__dhgAst.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -match '^(?i)Get-PackRoot$' }, $true))) {
+        $q = $__dhgC.Parent; while ($q -and $q -isnot $__dhgL) { $q = $q.Parent }
+        if (-not $q) { $selfDep = 1 }
+      }
+    }
+  } catch { $selfDep = 1 }
+  if (-not $selfDep) {
+    $kitRoot = Split-Path -Parent $script:DH_CODE
+    $kpcFull = [IO.Path]::GetFullPath($kitPackCommon)
+    # Then what it defines or changes is looked into as a second check. Its own and PowerShell's automatic
+    # variables are skipped; nothing here may stop the script loading (the error preference is kept, any error
+    # sets the copy's file aside).
+    $__dhgEap = $ErrorActionPreference
+    try {
+      $__dhgBefore = @{}; foreach ($__dhgV in @(Get-Variable -Scope Script)) { $__dhgBefore[$__dhgV.Name] = $__dhgV.Value }
+      . $kitPackCommon
+      $ErrorActionPreference = 'Continue'
+      $__dhgIn = { param($x) $x -is [string] -and $x.StartsWith($kitRoot, [StringComparison]::OrdinalIgnoreCase) }
+      foreach ($__dhgV in @(Get-Variable -Scope Script)) {
+        if ($__dhgV.Name -like '__dhg*' -or $__dhgV.Name -in @('selfDep', 'kitRoot', 'kpcFull', 'kitPackCommon', '_', 'PSItem', '$', '^', '?', 'args', 'input',
+                                                                  'Matches', 'Error', 'LASTEXITCODE', 'StackTrace', 'MyInvocation', 'PSCommandPath', 'PSScriptRoot',
+                                                                  'foreach', 'switch', 'this', 'PSBoundParameters', 'ofs')) { continue }   # PowerShell's own
+        if ($__dhgBefore.ContainsKey($__dhgV.Name) -and [object]::ReferenceEquals($__dhgBefore[$__dhgV.Name], $__dhgV.Value)) { continue }
+        $__dhgVals = @($__dhgV.Value)                 # a string, or the items of an array, or a table's values
+        if ($__dhgV.Value -is [Collections.IDictionary]) { $__dhgVals = @($__dhgV.Value.Values) }
+        foreach ($__dhgX in $__dhgVals) {
+          # a script block, an error or an invocation record names the file it came from, not a folder it uses
+          if ($__dhgX -is [scriptblock] -or $__dhgX -is [Management.Automation.ErrorRecord] -or $__dhgX -is [Management.Automation.InvocationInfo]) { continue }
+          if (& $__dhgIn $__dhgX) { $selfDep++ }
+          elseif ($__dhgX -is [Collections.IDictionary]) { foreach ($__dhgY in $__dhgX.Values) { if (& $__dhgIn $__dhgY) { $selfDep++ } } }
+          elseif ($__dhgX -and $__dhgX -isnot [string] -and $__dhgX.PSObject) { foreach ($__dhgP in $__dhgX.PSObject.Properties) { try { if (& $__dhgIn $__dhgP.Value) { $selfDep++ } } catch { } } }
+        }
+      }
+    } catch { $selfDep = 1 }
+    finally { $ErrorActionPreference = $__dhgEap }
+  }
+  if ($selfDep) { . $packCommon }
+  else {
+    # the copy's Get-PackRoot would answer the copy's folder: this install's pack folder instead
+    function Get-PackRoot { return $script:DH_PACK }
+    $script:DH_PACKCOMMON_FROM = 'copy'
+  }
+} else { . $packCommon }
 
 $script:DH_BROKER  = 'http://127.0.0.1:8770'
 if ($script:DH_SANDBOX) {
@@ -141,17 +233,66 @@ function Test-DhDataDirPrivate([string]$dir) {
   } catch { return $false }
 }
 
+function Test-DhFolderTrusted([string]$dir, [bool]$needPrivate) {
+  # $true when only this account and the system can change the data folder or anything above it (review of PR #45
+  # rounds 16-17). SIDs are read without translating names (an orphaned "Account Unknown" entry on a second drive
+  # is simply not this account). A network folder is never trusted (share permissions and the server are not
+  # visible from here). $needPrivate (release builds): the folder itself is private as the installer makes it.
+  # $script:DH_TRUST_WHY says which rule failed, for the host's message.
+  $script:DH_TRUST_WHY = ''
+  try {
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sidT = [Security.Principal.SecurityIdentifier]
+    $full = [IO.Path]::GetFullPath($dir).TrimEnd('\')
+    if ($full.StartsWith('\\')) { $script:DH_TRUST_WHY = "the data folder is on the network ($full)"; return $false }
+    $root = [IO.Path]::GetPathRoot($full)
+    $drv = New-Object IO.DriveInfo $root
+    if ($drv.DriveType -eq [IO.DriveType]::Network) { $script:DH_TRUST_WHY = "the data folder is on a network drive ($full)"; return $false }
+    if ($drv.DriveFormat -notin @('NTFS', 'ReFS')) { $script:DH_TRUST_WHY = "the data folder's drive has no Windows permissions ($($drv.DriveFormat))"; return $false }
+    if ((Test-Path -LiteralPath $full) -and ((Get-Item -LiteralPath $full -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { $script:DH_TRUST_WHY = "the data folder is a link to another folder ($full)"; return $false }
+    $okSids = @($me, 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    if ($needPrivate) {
+      $acl = Get-Acl -LiteralPath $full
+      if (-not $acl.AreAccessRulesProtected -or $acl.GetOwner($sidT).Value -ne $me) { $script:DH_TRUST_WHY = "the data folder is not private to this Windows account ($full)"; return $false }
+      foreach ($r in $acl.GetAccessRules($true, $true, $sidT)) { if ($r.IdentityReference.Value -notin @($me, 'S-1-5-18')) { $script:DH_TRUST_WHY = "another account ($($r.IdentityReference.Value)) has access to the data folder ($full)"; return $false } }
+    }
+    # every folder above: no junction or link, owned by this account or the system, and nobody else may delete it,
+    # change its permissions, take it over, or delete what is inside it
+    $chain = @(); $c = Split-Path -Parent $full
+    while ($c) { $chain += $c; $n = Split-Path -Parent $c; if (-not $n -or $n -eq $c) { break }; $c = $n }
+    for ($i = 0; $i -lt $chain.Count; $i++) {
+      $f = $chain[$i]; $isRoot = ($i -eq $chain.Count - 1)
+      if ((Get-Item -LiteralPath $f -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { $script:DH_TRUST_WHY = "a folder above the data folder is a link ($f)"; return $false }
+      $acl = Get-Acl -LiteralPath $f
+      $own = $acl.GetOwner($sidT).Value
+      if ($own -notin $okSids) { $script:DH_TRUST_WHY = "a folder above the data folder belongs to another account ($f, $own)"; return $false }
+      foreach ($r in $acl.GetAccessRules($true, $true, $sidT)) {
+        if ($r.AccessControlType -ne 'Allow' -or ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+        if ($r.IdentityReference.Value -in $okSids) { continue }
+        # 0x40 delete children, 0x40000 change permissions, 0x80000 take ownership, generic all / generic write;
+        # 0x10000 delete (not on a drive's root, which cannot be deleted)
+        $bad = 0x40 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+        if (-not $isRoot) { $bad = $bad -bor 0x10000 }
+        if ([int64]$r.FileSystemRights -band $bad) { $script:DH_TRUST_WHY = "another account ($($r.IdentityReference.Value)) can rename or replace a folder above the data folder ($f)"; return $false }
+      }
+    }
+    return $true
+  } catch { $script:DH_TRUST_WHY = "the data folder's permissions could not be read ($($_.Exception.Message))"; return $false }
+}
+# The data folder an update or its undo may rely on (DocHostActions.ps1 Test-DhDataDirTrustedEarly, the same rule).
+function Test-DhDataDirTrusted { return (Test-DhFolderTrusted $script:DH_DATA (-not $script:DH_SANDBOX)) }
+
 # ---- settings ---------------------------------------------------------------------------------------
 # remote_recover: let remote players use the lobby's Restart and Refresh screens buttons (default ON).
 # video:          broadcast video (default ON, as Setup.ps1 defaults it).
 # site_rom:       the game version the website had for this cabinet at pairing time.
 function Get-DhSettings {
-  $s = [ordered]@{ remote_recover = $true; video = $true; site_rom = '' }
+  $s = [ordered]@{ remote_recover = $true; video = $true; site_rom = ''; update_mode = 'auto'; update_channel = 'stable' }
   $p = Join-Path $script:DH_DATA 'settings.json'
   if (Test-Path -LiteralPath $p) {
     try {
       $j = [IO.File]::ReadAllText($p) | ConvertFrom-Json
-      foreach ($k in @('remote_recover', 'video', 'site_rom')) {
+      foreach ($k in @('remote_recover', 'video', 'site_rom', 'update_mode', 'update_channel')) {
         if ($j.PSObject.Properties.Name -contains $k) { $s[$k] = $j.$k }
       }
     } catch { }
@@ -374,6 +515,17 @@ function Get-DhForeignTasks {
     }
   }
   return $out
+}
+
+# The program the scheduled tasks start (with --hidden-run). hostapp\DocHostTask.exe is the stable launcher: only
+# the full installer writes it and no update ever replaces it (review of PR #45), so a power cut while an update
+# swaps DOC Host.exe can never leave the tasks, and with them the 30-minute run that undoes the update, without a
+# program to start. An install without it (an older build) uses DOC Host.exe; $null = neither (powershell.exe).
+function Get-DhTaskLauncher {
+  foreach ($p in @((Join-Path $script:DH_SCRIPTS 'DocHostTask.exe'), (Join-Path $script:DH_APP 'DOC Host.exe'))) {
+    if (Test-Path -LiteralPath $p -PathType Leaf) { return $p }
+  }
+  return $null
 }
 
 function Get-DhOurTasks {

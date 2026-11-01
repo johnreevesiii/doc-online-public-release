@@ -17,7 +17,7 @@
 # doc_home_ tasks), 4 refused (port 8770 belongs to another install, or not paired).
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet('Info', 'Pair', 'Start', 'Stop', 'FixPicture', 'RestartGame', 'Doctor', 'SetOption')]
+  [ValidateSet('Info', 'Pair', 'Start', 'Stop', 'FixPicture', 'RestartGame', 'Doctor', 'SetOption', 'CheckUpdate', 'ApplyUpdate', 'AutoUpdate', 'Recover')]
   [string]$Action,
   [int]$Seats = 0,
   [string]$Rom = '',
@@ -29,11 +29,197 @@ param(
   [string]$Value = ''
 )
 
+# ---- an interrupted update is undone by the code that started it (review of PR #45) ------------------------------
+# Before anything else is loaded: after a power cut in the middle of an update these scripts may be a mix of the
+# old and new release. The actions that undo an interrupted update first run that undo from the frozen copy the
+# update saved before its first swap (DocHostUpdate.ps1 Save-DhRecoveryKit), as "-Action Recover -Value <action>".
+# Only plain file reads here, nothing from the other scripts. The copy answers 10 + the undo's code, or 9 (another
+# action holds the lock); anything else (the copy itself failed) falls through to this install's own undo below.
+# The copy runs only when it can be trusted as much as these scripts (review of PR #45 round 12): it names THIS
+# install, nothing on its path is a junction or link, its files belong to this account, and (release builds) the
+# data folder is private to this account and SYSTEM, as the installer makes it. Otherwise the install's own undo runs.
+# DOCHOST_RERUN marks the fresh run below: it never runs the copy again (it can only turn the copy off, so it is
+# honoured in release builds too), which bounds the hand-over to one level even if the marker could not be removed.
+function Test-DhDataDirTrustedEarly([string]$dir, [bool]$needPrivate) {
+  # $true when only this account and the system can change the data folder or anything above it (review of PR #45
+  # rounds 16-17). SIDs are read without translating names (an orphaned "Account Unknown" entry on a second drive
+  # is simply not this account). A network folder is never trusted (share permissions and the server are not
+  # visible from here). $needPrivate (release builds): the folder itself is private as the installer makes it.
+  # $script:DH_TRUST_WHY says which rule failed, for the host's message.
+  $script:DH_TRUST_WHY = ''
+  try {
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $sidT = [Security.Principal.SecurityIdentifier]
+    $full = [IO.Path]::GetFullPath($dir).TrimEnd('\')
+    if ($full.StartsWith('\\')) { $script:DH_TRUST_WHY = "the data folder is on the network ($full)"; return $false }
+    $root = [IO.Path]::GetPathRoot($full)
+    $drv = New-Object IO.DriveInfo $root
+    if ($drv.DriveType -eq [IO.DriveType]::Network) { $script:DH_TRUST_WHY = "the data folder is on a network drive ($full)"; return $false }
+    if ($drv.DriveFormat -notin @('NTFS', 'ReFS')) { $script:DH_TRUST_WHY = "the data folder's drive has no Windows permissions ($($drv.DriveFormat))"; return $false }
+    if ((Test-Path -LiteralPath $full) -and ((Get-Item -LiteralPath $full -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { $script:DH_TRUST_WHY = "the data folder is a link to another folder ($full)"; return $false }
+    $okSids = @($me, 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    if ($needPrivate) {
+      $acl = Get-Acl -LiteralPath $full
+      if (-not $acl.AreAccessRulesProtected -or $acl.GetOwner($sidT).Value -ne $me) { $script:DH_TRUST_WHY = "the data folder is not private to this Windows account ($full)"; return $false }
+      foreach ($r in $acl.GetAccessRules($true, $true, $sidT)) { if ($r.IdentityReference.Value -notin @($me, 'S-1-5-18')) { $script:DH_TRUST_WHY = "another account ($($r.IdentityReference.Value)) has access to the data folder ($full)"; return $false } }
+    }
+    # every folder above: no junction or link, owned by this account or the system, and nobody else may delete it,
+    # change its permissions, take it over, or delete what is inside it
+    $chain = @(); $c = Split-Path -Parent $full
+    while ($c) { $chain += $c; $n = Split-Path -Parent $c; if (-not $n -or $n -eq $c) { break }; $c = $n }
+    for ($i = 0; $i -lt $chain.Count; $i++) {
+      $f = $chain[$i]; $isRoot = ($i -eq $chain.Count - 1)
+      if ((Get-Item -LiteralPath $f -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { $script:DH_TRUST_WHY = "a folder above the data folder is a link ($f)"; return $false }
+      $acl = Get-Acl -LiteralPath $f
+      $own = $acl.GetOwner($sidT).Value
+      if ($own -notin $okSids) { $script:DH_TRUST_WHY = "a folder above the data folder belongs to another account ($f, $own)"; return $false }
+      foreach ($r in $acl.GetAccessRules($true, $true, $sidT)) {
+        if ($r.AccessControlType -ne 'Allow' -or ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+        if ($r.IdentityReference.Value -in $okSids) { continue }
+        # 0x40 delete children, 0x40000 change permissions, 0x80000 take ownership, generic all / generic write;
+        # 0x10000 delete (not on a drive's root, which cannot be deleted)
+        $bad = 0x40 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+        if (-not $isRoot) { $bad = $bad -bor 0x10000 }
+        if ([int64]$r.FileSystemRights -band $bad) { $script:DH_TRUST_WHY = "another account ($($r.IdentityReference.Value)) can rename or replace a folder above the data folder ($f)"; return $false }
+      }
+    }
+    return $true
+  } catch { $script:DH_TRUST_WHY = "the data folder's permissions could not be read ($($_.Exception.Message))"; return $false }
+}
+# Read once and cleared at once, so nothing this run starts inherits them (round 17 red team): a stale one could
+# turn the copy off for a later interrupted update or hold the time guard back.
+$script:DH_IS_RERUN = ($env:DOCHOST_RERUN -eq '1'); $script:DH_T0_IN = [string]$env:DOCHOST_T0
+Remove-Item Env:\DOCHOST_RERUN, Env:\DOCHOST_T0 -ErrorAction SilentlyContinue
+if ($Action -in @('Start', 'RestartGame', 'ApplyUpdate', 'AutoUpdate') -and -not $script:DH_IS_RERUN -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'recovery-app.txt'))) {
+  $kitRun = $null; $why = ''
+  try {
+    $rel = Test-Path -LiteralPath (Join-Path $PSScriptRoot 'RELEASE')
+    $dd = ''
+    $ddf = Join-Path $PSScriptRoot 'datadir.txt'                   # DocHostCommon.ps1 Get-DhDataDir, same rule
+    if (Test-Path -LiteralPath $ddf) { $dd = ([IO.File]::ReadAllText($ddf)).Trim() }
+    if (-not $dd) { $dd = Join-Path $env:LOCALAPPDATA $(if ($rel) { 'DOC Host\data' } else { 'DOC Host TEST\data' }) }
+    $ipf = Join-Path $dd 'updates\in-progress.json'
+    if (Test-Path -LiteralPath $ipf) {
+      $att = [string](([IO.File]::ReadAllText($ipf)) | ConvertFrom-Json).attempt
+      if ($att -match '^[0-9a-f]{12}$') {
+        $kitDir = Join-Path $dd ("updates\recovery\{0}\hostapp" -f $att)
+        $kit = Join-Path $kitDir 'DocHostActions.ps1'; $kitApp = Join-Path $kitDir 'recovery-app.txt'
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        # this account, or Administrators/SYSTEM (an update run from DOC Host started as administrator)
+        $ownedByMe = { param($p) ((Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value -in @($me, 'S-1-5-32-544', 'S-1-5-18')) }
+        $ok = (Test-Path -LiteralPath $kit -PathType Leaf) -and (Test-Path -LiteralPath $kitApp -PathType Leaf)
+        if ($ok) {
+          # long forms on both sides (an 8.3 short path such as JOHNPC~1 must not refuse a good copy)
+          $want = (Get-Item -LiteralPath (Split-Path -Parent $PSScriptRoot) -Force).FullName.TrimEnd('\')
+          $nm = ([IO.File]::ReadAllText($kitApp)).Trim()
+          if (-not $nm -or -not (Test-Path -LiteralPath $nm -PathType Container)) { $ok = $false }
+          else { $ok = (Get-Item -LiteralPath $nm -Force).FullName.TrimEnd('\').Equals($want, [StringComparison]::OrdinalIgnoreCase) }
+        }
+        if ($ok) {                                     # no junction or link from the data folder down to the copy
+          $d = $kitDir
+          while ($ok -and $d.Length -ge $dd.TrimEnd('\').Length) {
+            if ((Get-Item -LiteralPath $d -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { $ok = $false }
+            $d = Split-Path -Parent $d
+          }
+          $kitPack = Join-Path (Split-Path -Parent $kitDir) 'pack'
+          foreach ($pd in @($kitPack, (Join-Path $kitPack 'setup'))) {   # the copy's pack folder too
+            if ($ok -and (Test-Path -LiteralPath $pd) -and ((Get-Item -LiteralPath $pd -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { $ok = $false }
+          }
+          $kitPC = Join-Path $kitPack 'setup\Common.ps1'
+          if ($ok -and (Test-Path -LiteralPath $kitPC) -and (((Get-Item -LiteralPath $kitPC -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (& $ownedByMe $kitPC))) { $ok = $false }
+          foreach ($p in @($kit, $kitApp, (Join-Path $kitDir 'DocHostCommon.ps1'), (Join-Path $kitDir 'DocHostUpdate.ps1'))) {
+            if ($ok -and (-not (Test-Path -LiteralPath $p -PathType Leaf) -or ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not (& $ownedByMe $p))) { $ok = $false }
+          }
+        }
+        # the data folder and every folder above it: only this account and the system can change them (rounds 16-17)
+        if ($ok -and -not (Test-DhDataDirTrustedEarly $dd ($rel -or $env:DOCHOST_SANDBOX -ne '1'))) { $ok = $false; $why = $script:DH_TRUST_WHY }
+        if ($ok) { $kitRun = $kit } else { [Console]::Out.WriteLine(('an interrupted update''s recovery copy failed its checks{0}: using this install''s own undo' -f $(if ($why) { " ($why)" } else { '' }))) }
+      }
+    }
+  } catch {
+    $kitRun = $null
+    [Console]::Out.WriteLine(('an interrupted update''s recovery copy failed its checks ({0}): using this install''s own undo' -f $_.Exception.Message))
+  }
+  if ($kitRun) {
+    # bounded: the copy runs outside the update task's job, so the task's time limit would not stop it
+    $kp = Start-Process -FilePath ((Get-Process -Id $PID).Path) -NoNewWindow -PassThru -ArgumentList @(
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $kitRun + '"'), '-Action', 'Recover', '-Value', $Action)
+    $null = $kp.Handle                                 # Windows PowerShell 5.1 reports no exit code without it
+    if (-not $kp.WaitForExit(1800000)) {
+      try { $kp.Kill() } catch { }
+      [Console]::Out.WriteLine('the undo of an interrupted update did not finish in 30 minutes: stopped; it is tried again next time')
+      exit 1
+    }
+    $kc = $kp.ExitCode
+    if ($kc -eq 9) {                                   # busy, as each action answered busy before
+      [Console]::Out.WriteLine('busy: another DOC Host action is running (an update in progress finishes or is undone first)')
+      exit $(if ($Action -eq 'AutoUpdate') { 0 } else { 2 })
+    }
+    if ($kc -ge 10 -and $kc -le 15) {
+      $rr = $kc - 10                                   # Repair-DhInterruptedUpdate's code
+      switch ($Action) {
+        'Start'       { if ($rr -eq 1) { exit 1 } }
+        'RestartGame' { if ($rr -eq 1 -or $rr -eq 5) { exit 1 }; if ($rr -eq 3) { exit 0 } }   # 3: the undo started it
+        default       { if ($rr -eq 1 -or $rr -eq 5) { exit 1 }; if ($rr -eq 2) { exit 0 } }
+      }
+      # Undone (or nothing left). This process already parsed THIS DocHostActions.ps1, which may be the new release's
+      # one the undo just replaced: the action runs again in a fresh process, on the restored files (review of PR #45
+      # round 15). It cannot loop: the undo removed the marker, so the fresh run skips this block.
+      # Only the arguments these four actions take, each checked (round 16: Windows PowerShell 5.1 passes quotes
+      # inside an argument through unescaped, so nothing free-form is handed on).
+      $ra = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Action', $Action)
+      if ($Seats -gt 0) { $ra += @('-Seats', [string][int]$Seats) }
+      if ($Rom) {
+        # a game name is handed on only when it is a plain key; any other is refused aloud, never dropped (round 17
+        # review: dropped, Start would quietly host cabinet.json's game instead)
+        if ($Rom -notmatch '^[A-Za-z0-9_]{1,32}$') { [Console]::Out.WriteLine("the game '$Rom' is not a known game key: press Start hosting again"); exit 1 }
+        $ra += @('-Rom', $Rom)
+      }
+      foreach ($sw in @('LocalPlay', 'NoVideo', 'Force')) { if ($PSBoundParameters.ContainsKey($sw) -and $PSBoundParameters[$sw].IsPresent) { $ra += "-$sw" } }
+      # Set for the fresh run only (it clears them at its top). It is bounded like the copy's run (it runs outside the
+      # update task's job too): the time the task has left, or 30 minutes for a button; a run stopped part way is
+      # an interrupted update the next run undoes (round 17 red team).
+      $tStart = Get-Date; try { $tStart = (Get-Process -Id $PID).StartTime } catch { }
+      $env:DOCHOST_RERUN = '1'; $env:DOCHOST_T0 = $tStart.ToUniversalTime().ToString('o')
+      $ra[5] = '"' + $PSCommandPath + '"'                 # Start-Process joins the arguments as they are
+      $limitMs = 1800000
+      if ($Action -in @('ApplyUpdate', 'AutoUpdate')) { $limitMs = [int][Math]::Max(60000, (57 * 60000) - ((Get-Date) - $tStart).TotalMilliseconds) }
+      $rp = $null; try { $rp = Start-Process -FilePath ((Get-Process -Id $PID).Path) -NoNewWindow -PassThru -ArgumentList $ra -ErrorAction Stop } catch { }
+      Remove-Item Env:\DOCHOST_RERUN, Env:\DOCHOST_T0 -ErrorAction SilentlyContinue
+      if (-not $rp) { [Console]::Out.WriteLine('the interrupted update was undone, but the action could not be started again: press it again'); exit 1 }
+      $null = $rp.Handle
+      if (-not $rp.WaitForExit($limitMs)) {
+        try { $rp.Kill() } catch { }
+        [Console]::Out.WriteLine('the action after the undo did not finish in time: stopped; it is tried again next time')
+        exit 1
+      }
+      exit $rp.ExitCode
+    }
+  }
+}
+
 . (Join-Path $PSScriptRoot 'DocHostCommon.ps1')
+. (Join-Path $PSScriptRoot 'DocHostUpdate.ps1')
 $root = $script:DH_PACK
 $logs = Join-Path $root 'logs'
 
 function Say([string]$m) { [Console]::Out.WriteLine($m); Write-DhLog 'dochost-actions.log' ("{0}: {1}" -f $Action, $m) }
+
+# The pack's lobby and hub checks (setup\Common.ps1) use Invoke-RestMethod, whose -TimeoutSec in PowerShell 5.1
+# bounds only the wait for headers: a server dripping its body held them, and the action lock, indefinitely
+# (review of PR #45 round 10). Within DOC Host's actions they go through Invoke-DhHttp, with an overall deadline.
+function Get-DhJsonBounded([string]$url, [int]$deadlineS = 20) {
+  try { $r = Invoke-DhHttp $url $null 256KB '' $deadlineS; return ([Text.Encoding]::UTF8.GetString($r.Bytes) | ConvertFrom-Json) } catch { return $null }
+}
+function Test-Tunnel([string]$id) {
+  $t = Get-DhJsonBounded ("{0}/hub/cab_{1}/api/health" -f $script:HUB, $id)
+  return [bool]($t -and $t.ok)
+}
+function Get-LobbyEndpoints([string]$id) {
+  $j = Get-DhJsonBounded ("{0}/api/cabinet/endpoints?id={1}" -f $script:LOBBY, $id)
+  if (-not $j) { return [pscustomobject]@{ Ok = $false; Broker = ''; Whep = '' } }
+  return [pscustomobject]@{ Ok = ([bool]$j.broker_base -and [bool]$j.whep_base); Broker = [string]$j.broker_base; Whep = [string]$j.whep_base }
+}
 
 # ---------------------------------------------------------------------------------------------------
 function Invoke-Info {
@@ -51,6 +237,9 @@ function Invoke-Info {
     $migratedCards = @($all | Where-Object { $_.FullName -match '\\cards\\' -and $_.Extension -eq '.card' }).Count
   }
   $foreign = @(Get-DhForeignTasks | ForEach-Object { $_.Name + ' (' + $_.State + '): ' + $_.Args.Substring(0, [Math]::Min(160, $_.Args.Length)) })
+  # A game the website chose for this cabinet after this PC started its current one (site-rom.json, written by the
+  # relay agent from the heartbeat reply): offered as the game for the next Start.
+  $siteRom = $(if ($cab) { Get-DhSiteRom -PendingOnly } else { $null })
   $info = [ordered]@{
     pack_version = $ver
     pack_root = $root
@@ -65,7 +254,8 @@ function Invoke-Info {
     paired = [bool]$paired
     cabinet = $(if ($cab) { [ordered]@{
         id = [string]$cab.id; label = [string]$cab.label; seats = (Get-SeatCount $cab)
-        rom = [string]$cab.rom_ver; local_seats = @($cab.local_seats) } } else { $null })
+        rom = $(if ($siteRom) { $siteRom } else { [string]$cab.rom_ver }); local_seats = @($cab.local_seats)
+        site_rom_pending = [bool]$siteRom } } else { $null })
     settings = (Get-DhSettings)
     migrated_pending_saves = $migrated
     migrated_cards = $migratedCards
@@ -74,8 +264,29 @@ function Invoke-Info {
     legacy_data = $(if (Test-Path -LiteralPath $script:DH_LEGACY_DATA) { $script:DH_LEGACY_DATA } else { '' })
     release = $script:DH_RELEASE
   }
+  # Updates: the window shows the installed version and the last check; the 30-minute check is (re)registered
+  # here, so it exists whenever DOC Host has been opened (only once updates are set up).
+  $taskState = 'n/a'
+  if ((Test-DhUpdateConfigured) -and -not $script:DH_SANDBOX) {
+    try { $taskState = $(if (Register-DhUpdateTask) { 'ok' } else { 'failed' }) } catch { $taskState = 'failed' }
+  }
+  $upd = Get-DhUpdateInfo; $us = Get-DhUpdateSettings; $upd['task'] = $taskState
+  $upd['mode'] = $us.Mode; $upd['channel'] = $us.Channel
+  $info['update'] = $upd
   Write-DhJson 'INFO' $info
   return 0
+}
+
+# The website's game for this cabinet, as the relay agent last heard it (pack\site-rom.json), when it is a game this
+# pack can run. -PendingOnly: only when the site's choice is newer than the game this PC started.
+function Get-DhSiteRom([switch]$PendingOnly) {
+  $f = Join-Path $root 'site-rom.json'
+  if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { return $null }
+  try { $sr = [IO.File]::ReadAllText($f) | ConvertFrom-Json } catch { return $null }
+  $r = ([string]$sr.rom).Trim().ToLowerInvariant()
+  if (-not $r -or -not (Get-GameByRom $r)) { return $null }
+  if ($PendingOnly -and -not [bool]$sr.pending) { return $null }
+  return $r
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -191,6 +402,9 @@ function Stop-DhHosting {
 }
 
 function Invoke-Stop {
+  # the host's Stop wins: an undo afterwards never restarts hosting (if the marker cannot be rewritten, a stop
+  # request says the same thing to the updater)
+  try { Set-DhUpdateWasHosting $false; Clear-DhStopRequested } catch { try { Write-DhStopRequest } catch { } }
   Stop-DhHosting
   Start-Sleep -Seconds 2
   $h = Get-DhBrokerHealth
@@ -268,17 +482,22 @@ function Invoke-Start {
   Write-Cab $cab $root
   Backup-DhCabinet
   Say ("cabinet.json: {0} seat(s), game {1}{2}" -f $seats, $game.Name, $(if ($localSeats.Count) { ', seat 1 reserved for you' } else { '' }))
-  if ($s.site_rom -and $s.site_rom -ne $game.Rom) {
-    Write-DhJson 'SITEROM' ([ordered]@{ site = $s.site_rom; local = $game.Rom })
-    Say ("The website lists this cabinet as '{0}'. Set it to '{1}' on the website (Stable, Host section) or players are offered the wrong game." -f $s.site_rom, $game.Rom)
+  # The website follows the game this PC runs (2026-10-19): the relay agent reports it on every heartbeat, and the
+  # site serves players that game. A game chosen on the website after this PC started its last one is offered by the
+  # window at the next Start (Get-DhSiteRom); starting a different one here is the newer choice, so the site follows.
+  $siteNote = Get-DhSiteRom
+  if ($siteNote -and $siteNote -ne $game.Rom) {
+    Write-DhJson 'SITEROM' ([ordered]@{ site = $siteNote; local = $game.Rom })
+    Say ("The website had this cabinet set to '{0}'. You started '{1}', so the website switches to it within a minute." -f $siteNote, $game.Rom)
   }
 
   New-Item -ItemType Directory -Path $logs -Force | Out-Null
-  # Tasks run through "DOC Host.exe --hidden-run": a GUI exe, so the task opens no console window, and it starts
-  # PowerShell with no window. A task running powershell.exe directly flashes a console (and the listener's
-  # never closed); hosts close those on instinct, which kills the step. powershell.exe only if the exe is missing.
-  $hostExe = Join-Path $script:DH_APP 'DOC Host.exe'
-  $hidden = Test-Path -LiteralPath $hostExe
+  # Tasks run through "DocHostTask.exe --hidden-run" (the stable launcher, Get-DhTaskLauncher): a GUI exe, so the
+  # task opens no console window, and it starts PowerShell with no window. A task running powershell.exe directly
+  # flashes a console (and the listener's never closed); hosts close those on instinct, which kills the step.
+  # powershell.exe only if no launcher is there.
+  $hostExe = Get-DhTaskLauncher
+  $hidden = [bool]$hostExe
   $ps = $(if ($hidden) { $hostExe } else { 'powershell.exe' })
   $recArgs = '-PackRoot ' + (ConvertTo-PsLiteral $root)
   $tasks = @(
@@ -337,10 +556,16 @@ function Invoke-Start {
   if ($store) { Say ("broker healthy (store: {0})" -f $store) } else { Say 'broker not answering: open logs, services.log'; return 1 }
   $down = @(); foreach ($p in (Get-SeatPorts $seats)) { if (-not (Test-Port $p)) { $down += $p } }
   if ($down.Count) { Say ('seat stations not listening on: ' + ($down -join ', ')) } else { Say ("all {0} seat stations listening" -f $seats) }
-  if (Test-Tunnel $cab.id) { Say 'the lobby can reach this cabinet through the relay hub' } else { Say 'the hub link is not answering yet: give it a minute, then press Doctor' }
-  $ep = Get-LobbyEndpoints $cab.id
-  if (-not $ep.Ok) { foreach ($i in 1..6) { Start-Sleep -Seconds 10; $ep = Get-LobbyEndpoints $cab.id; if ($ep.Ok) { break } } }
-  if ($ep.Ok) { Say 'the lobby has this cabinet''s seat and video addresses' } else { Say 'the lobby has no addresses for this cabinet yet: press Doctor in a minute' }
+  # Report-only checks against the lobby and hub. An updater restart skips them ($SkipLobbyCheck from
+  # Restart-DhHostingForUpdate): a slow reply must never hold the action lock (PowerShell 5.1's -TimeoutSec does
+  # not bound a dripped body), and Doctor shows the same thing on demand.
+  if ($SkipLobbyCheck) { Say 'lobby and hub checks skipped after an update (press Doctor to see them)' }
+  else {
+    if (Test-Tunnel $cab.id) { Say 'the lobby can reach this cabinet through the relay hub' } else { Say 'the hub link is not answering yet: give it a minute, then press Doctor' }
+    $ep = Get-LobbyEndpoints $cab.id
+    if (-not $ep.Ok) { foreach ($i in 1..6) { Start-Sleep -Seconds 10; $ep = Get-LobbyEndpoints $cab.id; if ($ep.Ok) { break } } }
+    if ($ep.Ok) { Say 'the lobby has this cabinet''s seat and video addresses' } else { Say 'the lobby has no addresses for this cabinet yet: press Doctor in a minute' }
+  }
   Say ("hosting: {0}, {1} seat(s)" -f $game.Name, $seats)
   return 0
 }
@@ -398,6 +623,8 @@ function Invoke-SetOption {
   switch ($Name) {
     'remote_recover' { $s.remote_recover = ($Value -eq '1' -or $Value -eq 'true') }
     'video'          { $s.video = ($Value -eq '1' -or $Value -eq 'true') }
+    'update_mode'    { if ($Value -notin @('auto', 'ask')) { Say 'update_mode is auto or ask'; return 1 }; $s.update_mode = $Value }
+    'update_channel' { if ($Value -notin @('stable', 'beta')) { Say 'update_channel is stable or beta'; return 1 }; $s.update_channel = $Value }
     default { Say ("unknown option {0}" -f $Name); return 1 }
   }
   Set-DhSettings $s
@@ -405,12 +632,386 @@ function Invoke-SetOption {
   return 0
 }
 
+# ---- updates (doc-ops #117 Phase 1, D-015) --------------------------------------------------------------
+function Get-DhUpdateSettings {
+  # update_mode: auto (install when idle; D-015 default) or ask. channel: stable or beta.
+  $s = Get-DhSettings
+  $mode = $(if ($s.update_mode -in @('auto', 'ask')) { [string]$s.update_mode } else { 'auto' })
+  $ch = $(if ($s.update_channel -in @('stable', 'beta')) { [string]$s.update_channel } else { 'stable' })
+  return @{ Mode = $mode; Channel = $ch }
+}
+function Find-DhUpdate([switch]$Auto, [switch]$NoHash) {
+  # Returns @{ Code; Manifest; Plan; Bytes } or a code with a message already said. 0 = an update is ready to apply.
+  $cab = Read-Cab $root
+  if (-not (Test-DhUpdateConfigured)) { Say 'updates are not set up yet in this version of DOC Host'; return @{ Code = 3 } }
+  if (-not (Test-Paired $cab)) { Say 'updates need this PC to be paired first (Sign in and pair)'; return @{ Code = 4 } }
+  $us = Get-DhUpdateSettings; $iv = Get-DhInstalledVersion
+  try { $rm = Get-DhRemoteManifest $cab $us.Channel } catch { Say ("could not reach the website to check for updates: {0}" -f $_.Exception.Message); return @{ Code = 1 } }
+  if (-not $rm) { Say ("DOC Host {0} is up to date" -f $iv); Save-DhUpdateState ([ordered]@{ status = 'current'; installed = $iv }); Write-DhJson 'UPDATE' ([ordered]@{ status = 'current'; installed = $iv }); return @{ Code = 2 } }
+  $r = Read-DhManifest $rm.Bytes $rm.Sig $us.Channel $iv
+  if ($r.UpToDate) { Say ("DOC Host {0} is up to date" -f $iv); Save-DhUpdateState ([ordered]@{ status = 'current'; installed = $iv }); Write-DhJson 'UPDATE' ([ordered]@{ status = 'current'; installed = $iv }); return @{ Code = 2 } }
+  if (-not $r.Ok) { Say ("update refused: {0}" -f $r.Error); Save-DhUpdateState ([ordered]@{ status = 'refused'; installed = $iv; error = $r.Error }); Write-DhJson 'UPDATE' ([ordered]@{ status = 'refused'; installed = $iv; error = $r.Error }); return @{ Code = 1 } }
+  if ($Auto -and (@(Get-DhFailedVersions) -contains [string]$r.Manifest.version)) {
+    $m = ("update {0} failed on this PC before: waiting for a newer release (Update now in DOC Host retries it)" -f $r.Manifest.version)
+    Say $m; $st = [ordered]@{ status = 'failed'; installed = $iv; version = [string]$r.Manifest.version }
+    Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st; return @{ Code = 2 }
+  }
+  try { $plan = Get-DhUpdatePlan $r.Manifest $script:DH_APP -NoHash:$NoHash }
+  catch {
+    if ($_.Exception.Message -notlike 'layout change:*') { throw }
+    # refused each time it is checked (it costs nothing: before any download), never set aside, so it installs by
+    # itself once the host moves the blocking file or folder (review of PR #45 round 14)
+    $e = $_.Exception.Message
+    Say ("update {0} refused: {1}" -f $r.Manifest.version, $e)
+    $st = [ordered]@{ status = 'refused'; installed = $iv; version = [string]$r.Manifest.version; error = $e }
+    Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st; return @{ Code = 1 }
+  }
+  $plan = @($plan); $bytes = [int64](($plan | Measure-Object -Property Size -Sum).Sum)
+  $info = [ordered]@{ status = 'available'; installed = $iv; version = [string]$r.Manifest.version; required = [bool]$r.Manifest.required
+                      notes = [string]$r.Manifest.notes; files = @($plan).Count; bytes = $bytes }
+  Save-DhUpdateState $info; Write-DhJson 'UPDATE' $info
+  Say ("update {0} available: {1} file(s), {2:N1} MB{3}" -f $r.Manifest.version, @($plan).Count, ($bytes / 1MB), $(if ($r.Manifest.required) { ' (required)' } else { '' }))
+  return @{ Code = 0; Manifest = $r.Manifest; Plan = $plan; Cab = $cab }
+}
+function Invoke-CheckUpdate {
+  # The window learns here that updates are off (and why) instead of offering an Update now that would fail.
+  if (-not (Test-DhDataDirTrusted)) {
+    $st = [ordered]@{ status = 'off'; installed = (Get-DhInstalledVersion); why = $script:DH_TRUST_WHY }; Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st
+    Say ("updates are off on this PC: {0}" -f $script:DH_TRUST_WHY); return 1
+  }
+  # While hosting, the check never hashes files (the apply plans again, idle, with hashing).
+  $c = (Find-DhUpdate -NoHash:(Test-DhHostingNow)).Code; return $(if ($c -eq 2) { 0 } else { $c })   # up to date is a success
+}
+# Stop pressed while an update holds the action lock cannot run, so it leaves this note instead; every restart
+# the updater would do honours it (the host's Stop wins), and the host's next Start clears it.
+# It applies to the update running now: each update run clears it when it starts, and Stop and Start clear it.
+$script:DH_STOP_REQ = Join-Path $script:DH_DATA 'stop-requested.json'
+function Test-DhStopRequested { return (Test-Path -LiteralPath $script:DH_STOP_REQ) }
+function Clear-DhStopRequested { Remove-Item -LiteralPath $script:DH_STOP_REQ -Force -ErrorAction SilentlyContinue }
+function Write-DhStopRequest {
+  Write-DhFileAtomic $script:DH_STOP_REQ ((@{ at = (Get-Date).ToUniversalTime().ToString('o') }) | ConvertTo-Json -Compress)
+  try { Set-DhUpdateWasHosting $false } catch { }   # an undo of this update never restarts hosting either
+}
+function Restart-DhHostingForUpdate {
+  # Start again with what the last Start saved (cabinet.json and settings), as the window would.
+  # 6 = skipped because the host pressed Stop during this update.
+  if (Test-DhStopRequested) { Say 'the host pressed Stop during the update: hosting is not started again'; return 6 }
+  $cab = Read-Cab $root
+  $Seats = [int]$cab.seat_count; $Rom = [string]$cab.rom_ver
+  $LocalPlay = [bool](@($cab.local_seats).Count); $NoVideo = -not [bool](Get-DhSettings).video
+  $SkipLobbyCheck = $true
+  return @(Invoke-Start)[-1]
+}
+function Test-DhHealthyAfterUpdate([int]$waitS = 150) {
+  $deadline = (Get-Date).AddSeconds($waitS)
+  while ((Get-Date) -lt $deadline) {
+    if (@(Get-OurFlycast $root).Count -gt 0 -and (Get-DhBrokerHealth) -and (Test-DhBrokerOurs)) { return $true }
+    Start-Sleep -Seconds 5
+  }
+  return $false
+}
+function Repair-DhInterruptedUpdate([switch]$NoRestart, [switch]$Force) {
+  # An update killed part way is undone, completely, from its journal. 0 = nothing left over (or undone),
+  # 2 = waiting (a live broker reports players), 1 = could not be fully undone, 3 = undone and hosting started again,
+  # 5 = undone but hosting did not start again. Hosting is stopped for the undo
+  # when pack files are involved; a broker that does not answer never blocks it (a broken game must be undoable).
+  # Hosting comes back afterwards if it was on before the update (the marker says so) or when this stopped it,
+  # unless the caller starts it itself (-NoRestart: Start, Restart game). -Force: the caller interrupts players
+  # anyway (Start, Restart game), so it never waits for them.
+  $ip = Get-DhUpdateInProgress
+  if (-not $ip) { return 0 }
+  if (-not (Test-DhDataDirTrusted)) {
+    # the journal, backups and hashes the undo would copy into the install come from the data folder (round 17)
+    Say ("an interrupted update cannot be undone here: {0}. Start hosting is refused until then. Reinstalling DOC Host clears it (your data folder and everything in it are kept); updates stay off until the data folder is one only you can change, such as the default one." -f $script:DH_TRUST_WHY)
+    return 1
+  }
+  $wasH = [bool]$ip.was_hosting
+  $jr = Read-DhJournal
+  $packJ = @($jr | Where-Object { $_.Path -like 'pack/*' }).Count -gt 0
+  $hostJ = $packJ -and (Test-DhHostingNow)
+  if ($hostJ) {
+    if (-not $Force -and (Get-DhBrokerHealth)) {
+      $idleR = Test-DhUpdateIdle
+      if (-not $idleR.Idle) { Say ("an interrupted update waits to be undone: {0}" -f $idleR.Why); return 2 }
+    }
+    Say 'an earlier update was interrupted: stopping hosting to undo it'; Stop-DhHosting
+  }
+  # was_hosting with no pack swap journaled: the update died during or just before its stop. A cabinet left
+  # half stopped (something still running, broker not answering) is stopped fully so it can start cleanly; a
+  # working one (broker answering) is left alone.
+  if ($wasH -and -not $hostJ -and (Test-DhHostingNow) -and -not (Get-DhBrokerHealth)) {
+    Say 'an interrupted update left hosting half stopped: stopping it fully first'; Stop-DhHosting
+  }
+  $preVer = Get-DhInstalledVersion                  # = from for an unfinished attempt (stale and finished markers differ)
+  if (-not (Resume-DhInterruptedUpdate)) {
+    Say 'an interrupted update could not be fully undone: hosting stays stopped and no new update runs until it is. It retries every 30 minutes; if this stays, reinstall DOC Host (your data and horses are kept). Copies are in the updates folder.'
+    return 1
+  }
+  Say 'an interrupted update was undone; the PC is back on its previous version'
+  # a killed attempt counts as a failure, so a version that keeps dying (a stalled restart, a time-limit kill)
+  # is set aside after three tries instead of cycling stop, swap, undo forever
+  if ($ip.to -and $preVer -eq [string]$ip.from -and (Get-DhInstalledVersion) -ne [string]$ip.to) { try { Add-DhFailedVersion ([string]$ip.to) } catch { } }
+  # Only ever brings hosting back when it is DOWN (never restarts a live game) and when an update took it down
+  # (was_hosting, set after the stop succeeded) or this undo stopped it.
+  if (($hostJ -or $wasH) -and -not $NoRestart -and -not (Test-DhHostingNow)) {
+    $sc = @(Restart-DhHostingForUpdate)[-1]
+    if ($sc -eq 0) { return 3 }
+    if ($sc -eq 6) { return 0 }                     # the host asked to stop: undone, hosting left stopped
+    Say ("hosting did not start again after the undo (code {0}): press Start hosting" -f $sc)
+    return 5
+  }
+  return 0
+}
+function Invoke-DhRecover([string]$for) {
+  # Never waits for the lock, as the undo never did: a running update holds it for its whole swap and health check
+  # (its marker and copy exist meanwhile), and a busy button must answer at once.
+  $al = Enter-DhAction 0
+  if (-not $al) { return 9 }
+  Set-DhActionNote $for
+  try {
+    if (Get-DhUpdateInProgress) { Say 'an earlier update was interrupted: undoing it with the version that started it' }
+    switch ($for) {
+      'Start'       { Clear-DhStopRequested; $rr = Repair-DhInterruptedUpdate -NoRestart -Force }
+      'RestartGame' { Clear-DhStopRequested; $rr = Repair-DhInterruptedUpdate -Force }
+      default       { $rr = Repair-DhInterruptedUpdate; if ($rr -ne 1 -and $rr -ne 2) { Clear-DhStopRequested } }   # Invoke-ApplyUpdate's rule
+    }
+    return (10 + [int]@($rr)[-1])
+  } finally { Clear-DhActionNote; Exit-DhAction $al }
+}
+function Invoke-DhWithActionLock([string]$name, [scriptblock]$body, [int]$waitMs = 0) {
+  # The update downloads WITHOUT the action lock (a slow or stalled download never blocks Start, Stop or Restart
+  # game); it takes the lock only to undo or swap. $null = another action held it for the whole wait.
+  $al = Enter-DhAction $waitMs
+  if (-not $al) { return $null }
+  Set-DhActionNote $name
+  try { return @(& $body)[-1] } finally { Clear-DhActionNote; Exit-DhAction $al }
+}
+function Invoke-ApplyUpdate([switch]$Auto) {
+  # from the start of this run (the recovery copy's undo may already have used part of the task's hour)
+  $t0 = Get-Date; try { $t0 = (Get-Process -Id $PID).StartTime } catch { }
+  # a fresh run handed over after the copy's undo counts from the run that started the task (DOCHOST_T0 can only
+  # make this guard stricter: an earlier time is all it is ever used for)
+  if ($script:DH_T0_IN) {
+    try {
+      $t1 = [DateTime]::Parse($script:DH_T0_IN, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime()
+      if ($t1 -lt $t0 -and ((Get-Date) - $t1).TotalMinutes -le 65) { $t0 = $t1 }   # never older than the task's hour
+    } catch { }
+  }
+  # a request from an earlier, finished run is done with; one beside an interrupted update is still the host's
+  # word for its undo (cleared after the undo below)
+  if (-not (Get-DhUpdateInProgress)) { Clear-DhStopRequested }
+  $actName = $(if ($Auto) { 'AutoUpdate' } else { 'ApplyUpdate' })
+  if (Test-DhDataDirTrusted) { Remove-Item -LiteralPath (Join-Path $script:DH_UPD 'updates-off.txt') -Force -ErrorAction SilentlyContinue }
+  elseif (-not (Get-DhUpdateInProgress)) {
+    # an update's backups, journal and recovery copy live in the data folder: none if others can change it (round 17).
+    # The background check says so once a day and counts as done (it would only repeat itself every 30 minutes).
+    if ($Auto) {
+      $wf = Join-Path $script:DH_UPD 'updates-off.txt'; $today = (Get-Date).ToString('yyyy-MM-dd')
+      $last = ''; try { $last = ([IO.File]::ReadAllText($wf)).Trim() } catch { }
+      if ($last -eq $today) { return 0 }
+      try { New-Item -ItemType Directory -Path $script:DH_UPD -Force | Out-Null; [IO.File]::WriteAllText($wf, $today) } catch { }
+    }
+    $st = [ordered]@{ status = 'off'; installed = (Get-DhInstalledVersion); why = $script:DH_TRUST_WHY }
+    try { Save-DhUpdateState $st } catch { }; Write-DhJson 'UPDATE' $st
+    Say ("updates are off on this PC: {0}. A plain reinstall keeps the same data folder; to turn updates on, the data folder must be one only you can change, such as the default one (DOC support can help move it)." -f $script:DH_TRUST_WHY)
+    return $(if ($Auto) { 0 } else { 1 })
+  }
+  if (Get-DhUpdateInProgress) {
+    $rr = Invoke-DhWithActionLock $actName { Repair-DhInterruptedUpdate }
+    if ($null -eq $rr) { Say 'an interrupted update waits: another DOC Host action is running'; return 0 }
+    if ($rr -eq 2) { return 0 }
+    if ($rr -ne 1) { Clear-DhStopRequested }        # the undo honoured it
+    if ($rr -eq 1 -or $rr -eq 5) { return 1 }
+  }
+  # The background run checks idle FIRST, so nothing heavy (planning, hashing) happens while players are seated.
+  if ($Auto) {
+    $idle0 = Test-DhUpdateIdle
+    if (-not $idle0.Idle) { Say ("update check skipped: {0}" -f $idle0.Why); return 0 }
+  }
+  $f = Find-DhUpdate -Auto:$Auto
+  if ($f.Code -ne 0) { return $(if ($f.Code -eq 2) { 0 } else { $f.Code }) }
+  $us = Get-DhUpdateSettings
+  if ($Auto -and $us.Mode -eq 'ask' -and -not $f.Manifest.required) { Say 'update waiting for the host (Update now in DOC Host)'; return 0 }
+  $idle = Test-DhUpdateIdle
+  if (-not $idle.Idle) {
+    Say ("update waits: {0}" -f $idle.Why)
+    $st = [ordered]@{ status = 'waiting'; installed = (Get-DhInstalledVersion); version = [string]$f.Manifest.version; why = $idle.Why
+                      files = @($f.Plan).Count; bytes = [int64]((@($f.Plan) | Measure-Object -Property Size -Sum).Sum) }
+    Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st
+    return 0
+  }
+  $ver = [string]$f.Manifest.version; $old = Get-DhInstalledVersion
+  $staging = Join-Path $script:DH_UPD ("staging-" + $ver); $backup = Join-Path $script:DH_UPD ("backup-" + $old)
+  # staging folders of other versions (an abandoned download) are dropped; this version's resumes
+  Get-ChildItem -LiteralPath $script:DH_UPD -Directory -Filter 'staging-*' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $staging } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+  # Room: staging (the new files) and backups (the old ones) live under the data folder; the new copies sit beside
+  # the renamed-aside originals in the install folder until cleanup. Sum per drive (often both are C:).
+  $planBytes = [int64]((@($f.Plan) | Measure-Object -Property Size -Sum).Sum)
+  $oldBytes = [int64]0; foreach ($x in @($f.Plan)) { if (Test-Path -LiteralPath $x.Full) { $oldBytes += (Get-Item -LiteralPath $x.Full).Length } }
+  $needBy = @{}
+  $dDrive = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($script:DH_DATA)); $aDrive = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($script:DH_APP))
+  $needBy[$dDrive] = [int64]$needBy[$dDrive] + $planBytes + $oldBytes + 100MB
+  $needBy[$aDrive] = [int64]$needBy[$aDrive] + $planBytes + 100MB
+  foreach ($drv in $needBy.Keys) {
+    try { $free = (New-Object IO.DriveInfo $drv).AvailableFreeSpace } catch { $free = [int64]::MaxValue }
+    if ($free -lt $needBy[$drv]) { Say ("not enough free disk space for the update on {0} (need {1:N0} MB)" -f $drv, ($needBy[$drv] / 1MB)); return 1 }
+  }
+  Say ("downloading {0} file(s)..." -f @($f.Plan).Count)
+  try { Get-DhUpdateObjects $f.Plan $staging $f.Cab } catch { Say ("download stopped: {0} (nothing changed; it resumes next time)" -f $_.Exception.Message); return 1 }
+  # Near the scheduled task's 1-hour limit, do not start a swap the limit could cut (the next run resumes from
+  # the staged files, which are kept).
+  if ($Auto -and ((Get-Date) - $t0).TotalMinutes -gt 45) { Say 'update downloaded; the install runs on the next check (time limit)'; return 0 }
+  # A manual Update now waits up to 2 minutes for another action to finish; the background run tries once.
+  $rt = Invoke-DhWithActionLock $actName { Install-DhStagedUpdate } $(if ($Auto) { 0 } else { 120000 })
+  if ($null -eq $rt) {
+    Say 'update downloaded but NOT installed: another DOC Host action is running (it installs on a later check)'
+    return $(if ($Auto) { 0 } else { 2 })
+  }
+  return $rt
+}
+function Install-DhStagedUpdate {
+  # Runs under the action lock, inside Invoke-ApplyUpdate (reads its $f, $ver, $old, $staging, $backup, $Auto).
+  # Idle again: the download can take long, and players may have sat down since.
+  $idle = Test-DhUpdateIdle
+  if (-not $idle.Idle) {
+    Say ("update downloaded; it installs when {0} no longer applies" -f $idle.Why)
+    $st = [ordered]@{ status = 'waiting'; installed = $old; version = $ver; why = $idle.Why; files = @($f.Plan).Count; bytes = [int64]0 }
+    Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st
+    return 0
+  }
+  # Pack files are in use while hosting: stop, swap, start again. Only DOC Host's own files: no restart; the
+  # restart listener is refreshed so it runs the new script. The marker is written BEFORE hosting stops (a kill
+  # after it is undone); was_hosting is set just before the stop, so the undo also brings hosting back (only
+  # ever when hosting is down, never against a Stop the host pressed).
+  $packTouched = @($f.Plan | Where-Object { $_.Path.StartsWith('pack/', [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+  $wasHosting = Test-DhHostingNow
+  try { Set-DhUpdateInProgress $old $ver $false } catch { Say ("could not start the update: {0} (nothing changed)" -f $_.Exception.Message); return 1 }
+  # the frozen copy of this code that will undo the update if it is cut off part way (review of PR #45)
+  try { Save-DhRecoveryKit } catch { Clear-DhUpdateInProgress; Say ("could not start the update: could not save the recovery copy: {0} (nothing changed)" -f $_.Exception.Message); return 1 }
+  if ($packTouched -and $wasHosting) {
+    # set before the stop: a kill during it is undone and hosting comes back (the undo restarts only a cabinet
+    # that is down, finishes a half-stopped one, and the host's own Stop clears this)
+    Set-DhUpdateWasHosting $true
+    Say 'stopping hosting for the update (nobody is seated)'; Stop-DhHosting
+    $stopWait = (Get-Date).AddSeconds(15)             # a killed game takes a moment to exit
+    while ((Test-DhHostingNow) -and (Get-Date) -lt $stopWait) { Start-Sleep -Milliseconds 500 }
+    if (Test-DhHostingNow) {
+      Clear-DhUpdateInProgress                        # nothing swapped yet
+      try { Add-DhFailedVersion $ver } catch { }       # counts, so a stop that never completes is not retried every 30 minutes
+      Say 'hosting did not stop fully: starting it again; the update waits for a later check (nothing changed)'
+      Restart-DhHostingForUpdate | Out-Null
+      return 1
+    }
+  }
+  try { $done = Install-DhUpdateFiles $f.Plan $staging $backup }
+  catch {
+    Say $_.Exception.Message; Add-DhFailedVersion $ver
+    if ($_.Exception.Message -like '*ROLLBACK INCOMPLETE*') {
+      # the marker and journal stay: the next run retries the undo; hosting stays stopped on mixed files
+      $st = [ordered]@{ status = 'failed'; installed = $old; version = $ver }; Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st
+      return 1
+    }
+    Clear-DhUpdateInProgress
+    Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+    if ($packTouched -and $wasHosting) { Restart-DhHostingForUpdate | Out-Null }
+    $st = [ordered]@{ status = 'failed'; installed = $old; version = $ver }; Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st
+    return 1
+  }
+  $rec = Read-DhInstalled
+  try {
+    $map = [ordered]@{}
+    if ($rec -and $rec.files) { foreach ($p in $rec.files.PSObject.Properties) { $map[$p.Name] = [string]$p.Value } }
+    foreach ($x in $f.Manifest.files) { if (-not (Test-DhPreserved ([string]$x.path) @($f.Manifest.preserve)) -and -not (Test-DhCreateOnly ([string]$x.path)) -and -not $x.create_only) { $map[[string]$x.path] = [string]$x.sha256 } }
+    foreach ($x in @($f.Plan | Where-Object { $_.Remove })) { $map.Remove($x.Path) }
+    if (-not ($packTouched -and $wasHosting)) {
+      Save-DhInstalled $ver $map                      # the record first, then the marker: a crash between is "finished"
+      Clear-DhUpdateInProgress
+    }
+  } catch {
+    # Never leave new files without the record that says so: put the old files back.
+    Say ("could not record the update ({0}): rolling back" -f $_.Exception.Message)
+    $bad = Restore-DhUpdateFiles $done; Add-DhFailedVersion $ver
+    if ($bad.Count) { Say ("ROLLBACK INCOMPLETE for: {0} (copies in {1}); the next run retries" -f ($bad -join ', '), $backup); return 1 }
+    Clear-DhUpdateInProgress
+    if ($packTouched -and $wasHosting) { Restart-DhHostingForUpdate | Out-Null }
+    return 1
+  }
+  if ($packTouched -and $wasHosting) {
+    Say 'starting hosting again...'
+    Restart-DhHostingForUpdate | Out-Null
+    # the marker and journal stay until the game is healthy: a crash during the check or its rollback is undone
+    # from the journal on the next run
+    if (Test-DhStopRequested) {
+      if (Test-DhHostingNow) { Stop-DhHosting }      # Stop pressed while the restart was already running: carry it out
+      Save-DhInstalled $ver $map; Clear-DhUpdateInProgress; Say 'updated; hosting stays stopped as the host asked'
+    }
+    elseif (Test-DhHealthyAfterUpdate) { Save-DhInstalled $ver $map; Clear-DhUpdateInProgress }
+    else {
+      Say ("the game did not come back healthy after {0}: rolling back to {1}" -f $ver, $old)
+      Stop-DhHosting
+      $bad = Restore-DhUpdateFiles $done; if ($bad.Count) { Say ("ROLLBACK INCOMPLETE for: {0} (copies in {1})" -f ($bad -join ', '), $backup); return 1 }
+      Clear-DhUpdateInProgress
+      Add-DhFailedVersion $ver -Hard                  # the game did not come back: do not try this one again by itself
+      Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+      if ($rec) { Save-DhInstalled ([string]$rec.version) $rec.files } else { Remove-Item -LiteralPath $script:DH_INSTALLED -Force -ErrorAction SilentlyContinue }
+      Restart-DhHostingForUpdate | Out-Null
+      Save-DhUpdateState ([ordered]@{ status = 'rolled_back'; version = $ver; installed = $old })
+      Write-DhJson 'UPDATE' ([ordered]@{ status = 'rolled_back'; version = $ver; installed = $old })
+      return 1
+    }
+  } elseif (@(Get-DhOurTasks | Where-Object { $_.TaskName -eq (Get-TaskName 'recover') }).Count) {
+    $recScript = Join-Path $script:DH_SCRIPTS 'DocHostRecover.ps1'
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $cl = [string]$_.CommandLine; $cl.IndexOf($recScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $cl.IndexOf($recScript.Replace("'", "''"), [StringComparison]::OrdinalIgnoreCase) -ge 0 })) {
+      try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    if ($wasHosting) { Start-HomeTask 'recover' | Out-Null }
+  }
+  Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+  Clear-DhFailedVersions                            # installed: older failures no longer matter
+  Remove-DhOldBackups 2
+  $exeChanged = @($f.Plan | Where-Object { $_.Path -eq 'DOC Host.exe' }).Count -gt 0
+  $st = [ordered]@{ status = 'updated'; installed = $ver; from = $old; reopen = $exeChanged; notes = [string]$f.Manifest.notes }
+  Save-DhUpdateState $st; Write-DhJson 'UPDATE' $st
+  Say ("updated to {0}{1}" -f $ver, $(if ($exeChanged) { '. Reopen DOC Host to finish (its window is still the old version).' } else { '' }))
+  return 0
+}
+
 # ---------------------------------------------------------------------------------------------------
 $code = 0
-if ($Action -in @('Info', 'SetOption')) {
-  $code = @($(if ($Action -eq 'Info') { Invoke-Info } else { Invoke-SetOption }))[-1]
+if ($Action -in @('Info', 'SetOption', 'Doctor')) {
+  # report-only (Doctor runs the pack Doctor without any -Fix switch): no lock, so a slow lobby reply during its
+  # checks never blocks Start, Stop or an update
+  $code = @($(if ($Action -eq 'Info') { Invoke-Info } elseif ($Action -eq 'Doctor') { Invoke-Doctor } else { Invoke-SetOption }))[-1]
+} elseif ($Action -eq 'Recover') {
+  # run from the frozen recovery copy by the check at the top: undo an interrupted update the way -Value would.
+  # Exit 10 + the undo's code, or 9 when another action holds the lock.
+  $code = @(Invoke-DhRecover $Value)[-1]
+} elseif ($Action -in @('ApplyUpdate', 'AutoUpdate')) {
+  # One update at a time (its own lock); the action lock only around the undo and the swap (Invoke-ApplyUpdate).
+  $ul = New-Object Threading.Mutex($false, ('Local\DOCHost_Update_' + (Get-DhRootTag)))
+  $got = $false; try { $got = $ul.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }
+  if (-not $got) { $ul.Dispose(); Say 'an update is already running'; exit $(if ($Action -eq 'AutoUpdate') { 0 } else { 2 }) }
+  try {
+    $code = @(Invoke-ApplyUpdate -Auto:($Action -eq 'AutoUpdate'))[-1]
+    if ($Action -eq 'AutoUpdate') { Invoke-DhWithActionLock 'AutoUpdate' { Remove-DhAsideFiles $script:DH_APP; 0 } | Out-Null }
+  } catch {
+    Say ("error: {0}" -f $_.Exception.Message)
+    $code = 1
+  } finally { try { $ul.ReleaseMutex() } catch { }; $ul.Dispose() }
 } else {
-  $lock = Enter-DhAction 0
+  # the fresh run after the copy's undo waits briefly: the copy has just released the lock (round 16)
+  $lock = Enter-DhAction $(if ($script:DH_IS_RERUN) { 30000 } else { 0 })
+  if (-not $lock -and $Action -eq 'Stop') {
+    $holder = Get-DhActionNote
+    $updRunning = $false
+    try { $um = New-Object Threading.Mutex($false, ('Local\DOCHost_Update_' + (Get-DhRootTag))); try { if ($um.WaitOne(0)) { $um.ReleaseMutex() } else { $updRunning = $true } } catch [Threading.AbandonedMutexException] { $um.ReleaseMutex() }; $um.Dispose() } catch { }
+    if (($holder -and [string]$holder.action -in @('ApplyUpdate', 'AutoUpdate')) -or (-not $holder -and $updRunning)) {
+      try { Write-DhStopRequest } catch { }
+      Say 'Stop requested: an update is running; it will not start hosting again. Press Stop hosting again when it finishes if anything is still running.'
+    }
+  }
   if (-not $lock) {
     $note = Get-DhActionNote
     foreach ($line in (Get-DhBusyMessage $note)) { Say $line }
@@ -423,11 +1024,18 @@ if ($Action -in @('Info', 'SetOption')) {
   try {
     switch ($Action) {
       'Pair'        { $code = @(Invoke-Pair)[-1] }
-      'Start'       { $code = @(Invoke-Start)[-1] }
+      'Start'       { Clear-DhStopRequested; if ((Repair-DhInterruptedUpdate -NoRestart -Force) -eq 1) { $code = 1 } else { $code = @(Invoke-Start)[-1] } }   # never host half-updated files
       'Stop'        { $code = @(Invoke-Stop)[-1] }
       'FixPicture'  { $code = @(Invoke-FixPicture)[-1] }
-      'RestartGame' { $code = @(Invoke-RestartGame)[-1] }
+      'RestartGame' {
+        # the undo may stop the services; RestartGame.ps1 only restarts the game windows, so a stopped cabinet gets
+        # a full start from the undo (code 3) and that is the restart
+        Clear-DhStopRequested                         # the host asks for the game now
+        $rr = Repair-DhInterruptedUpdate -Force
+        if ($rr -eq 1 -or $rr -eq 5) { $code = 1 } elseif ($rr -eq 3) { $code = 0 } else { $code = @(Invoke-RestartGame)[-1] }
+      }
       'Doctor'      { $code = @(Invoke-Doctor)[-1] }
+      'CheckUpdate' { $code = @(Invoke-CheckUpdate)[-1] }
     }
   } catch {
     Say ("error: {0}" -f $_.Exception.Message)

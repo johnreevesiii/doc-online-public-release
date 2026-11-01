@@ -216,7 +216,7 @@ if ($MyInvocation.InvocationName -eq '.') { return }   # dot-sourced by a test: 
 
 $script:lastMissingLog = [datetime]::MinValue
 # One listener per install. The task used to be "ignore a new start while running", which kept a second copy
-# out; launched through "DOC Host.exe --hidden-run" the task ends at once, so the listener guards itself.
+# out; launched through "DocHostTask.exe --hidden-run" the task ends at once, so the listener guards itself.
 if (-not $Once) {
   $script:recMutex = New-Object Threading.Mutex($false, ('Local\DOCHost_Recover_' + (Get-DhRootTag)))
   $got = $false

@@ -18,6 +18,7 @@ using System.IO;
 using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -42,7 +43,15 @@ namespace DocHost
             // those windows on instinct, which killed the step (the restart listener's window never closed).
             // This exe is a GUI app, so the task opens no window; it starts PowerShell with no window and exits
             // at once, before the app mutex, so it never blocks an upgrade or the real window.
-            if (args.Length > 0 && args[0] == "--hidden-run")
+#if DOCHOST_TASKLAUNCHER
+            // hostapp\DocHostTask.exe: the same launcher built alone (build_installer.py). Every scheduled task starts
+            // through it. Only the full installer writes it, never an update, so a power cut while an update swaps
+            // DOC Host.exe still leaves the tasks a program to start, and the update task undoes the swap (review of
+            // PR #45). It never opens a window: without --hidden-run it exits with 2.
+            Environment.Exit(HiddenRun.Start(Environment.CommandLine));
+            return;
+#else
+            if (args.Length > 0 && (args[0] == "--hidden-run" || args[0] == "--hidden-run-wait"))
             {
                 Environment.Exit(HiddenRun.Start(Environment.CommandLine));
                 return;
@@ -64,24 +73,55 @@ namespace DocHost
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm(args));
             GC.KeepAlive(m);
+#endif
         }
     }
 
     // "DOC Host.exe" --hidden-run <powershell arguments>: everything after the flag goes to powershell.exe verbatim
     // (taken from the raw command line, so the task's own quoting reaches PowerShell unchanged).
+    // "--hidden-run-wait" (the update task) stays until PowerShell ends and holds it in a job that is killed with
+    // this process, so the task's time limit, Stop and "do not start a second copy" apply to the real updater.
+    // Only that PowerShell is in the job: anything it starts breaks away silently (hosting is never killed).
     static class HiddenRun
     {
-        public static string PowerShellArgs(string commandLine)
+        // The marker must be the FIRST argument after the program path (a folder named "--hidden-run" in the
+        // install path must not be mistaken for it). Returns null when absent.
+        public static string PowerShellArgs(string commandLine, out bool wait)
         {
-            int i = commandLine.IndexOf("--hidden-run", StringComparison.Ordinal);
-            if (i < 0) return null;
-            string rest = commandLine.Substring(i + "--hidden-run".Length);
-            return rest.TrimStart(' ', '\t');
+            wait = false;
+            string s = commandLine.TrimStart(' ', '\t');
+            int end;
+            if (s.StartsWith("\"")) { end = s.IndexOf('"', 1); if (end < 0) return null; end++; }
+            else { end = s.IndexOfAny(new[] { ' ', '\t' }); if (end < 0) return null; }
+            string rest = s.Substring(end).TrimStart(' ', '\t');
+            foreach (string m in new[] { "--hidden-run-wait", "--hidden-run" })
+            {
+                if (rest.StartsWith(m, StringComparison.Ordinal) && (rest.Length == m.Length || rest[m.Length] == ' ' || rest[m.Length] == '\t'))
+                {
+                    wait = m == "--hidden-run-wait";
+                    return rest.Substring(m.Length).TrimStart(' ', '\t');
+                }
+            }
+            return null;
         }
+        public static string PowerShellArgs(string commandLine) { bool w; return PowerShellArgs(commandLine, out w); }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct BasicLimit { public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct IoCounters { public ulong a, b, c, d, e, f; }
+        [StructLayout(LayoutKind.Sequential)]
+        struct ExtendedLimit { public BasicLimit Basic; public IoCounters Io; public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed; }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+        [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimit info, int len);
+        [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        const uint KILL_ON_JOB_CLOSE = 0x2000, SILENT_BREAKAWAY_OK = 0x1000;
 
         public static int Start(string commandLine)
         {
-            string a = PowerShellArgs(commandLine);
+            bool wait;
+            string a = PowerShellArgs(commandLine, out wait);
             if (string.IsNullOrEmpty(a)) return 2;
             try
             {
@@ -90,9 +130,21 @@ namespace DocHost
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 psi.WindowStyle = ProcessWindowStyle.Hidden;
-                psi.WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory;
-                using (Process.Start(psi)) { }
-                return 0;
+                psi.WorkingDirectory = Environment.SystemDirectory;
+                if (!wait) { using (Process.Start(psi)) { } return 0; }
+                IntPtr job = CreateJobObject(IntPtr.Zero, null);
+                if (job != IntPtr.Zero)
+                {
+                    ExtendedLimit li = new ExtendedLimit();
+                    li.Basic.LimitFlags = KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK;
+                    if (!SetInformationJobObject(job, 9, ref li, Marshal.SizeOf(typeof(ExtendedLimit)))) { CloseHandle(job); job = IntPtr.Zero; }
+                }
+                using (Process p = Process.Start(psi))
+                {
+                    if (job != IntPtr.Zero) AssignProcessToJobObject(job, p.Handle);
+                    p.WaitForExit();
+                    return p.ExitCode;                      // the job handle closes with this process
+                }
             }
             catch { return 1; }
         }
@@ -225,6 +277,9 @@ namespace DocHost
         Label lblTitle, lblCab, lblPairCode, lblNote;
         Button btnPair, btnSite, btnStart, btnStop, btnFix, btnRestart, btnDoctor, btnConsole, btnLogs, btnAdvanced;
         ComboBox cmbGame; NumericUpDown numSeats; CheckBox chkLocal, chkVideo, chkRemote;
+        // updates (doc-ops #117 Phase 1, D-015)
+        Label lblUpd; Button btnCheckUpd, btnApplyUpd; CheckBox chkAutoUpd; bool updAvailable, updConfigured; ToolTip updTip = new ToolTip();
+        string updInstalled = "", updTask = ""; DateTime updStateTime = DateTime.MinValue;
         TextBox txtLog;
         Light lPaired, lBroker, lGame, lStations, lLink, lVideo, lRemote;
         List<string> romKeys = new List<string>();
@@ -244,8 +299,8 @@ namespace DocHost
             Text = "DOC Host TEST build" + (P.Sandbox ? "  (sandbox)" : "");
 #endif
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            ClientSize = new Size(760, 600);
-            MinimumSize = new Size(776, 560);
+            ClientSize = new Size(760, 650);
+            MinimumSize = new Size(776, 610);
             Font = new Font("Segoe UI", 9f);
             StartPosition = FormStartPosition.CenterScreen;
             appLog = Path.Combine(P.LogsDir, "dochost-app.log");
@@ -314,8 +369,19 @@ namespace DocHost
             lblNote = new Label(); lblNote.AutoSize = false; lblNote.Location = new Point(10, 94); lblNote.Size = new Size(388, 36);
             lblNote.ForeColor = Color.FromArgb(150, 90, 0); gTools.Controls.Add(lblNote);
 
+            // ---- updates: signed, only changed files, installed when nobody is seated ----------------------
+            GroupBox gUpd = new GroupBox(); gUpd.Text = "Updates"; gUpd.Location = new Point(12, 412); gUpd.Size = new Size(736, 50); Controls.Add(gUpd);
+            lblUpd = new Label(); lblUpd.AutoSize = false; lblUpd.Location = new Point(10, 21); lblUpd.Size = new Size(250, 20);
+            lblUpd.Text = "Checking..."; gUpd.Controls.Add(lblUpd);
+            btnCheckUpd = Btn(gUpd, "Check for updates", 262, 16, 130, delegate { RunAction("CheckUpdate", "", null, false); });
+            btnApplyUpd = Btn(gUpd, "Update now", 398, 16, 100, delegate { RunAction("ApplyUpdate", "", delegate { LoadInfo(); }, false); });
+            chkAutoUpd = new CheckBox(); chkAutoUpd.Text = "Install automatically when nobody is seated"; chkAutoUpd.AutoSize = true;
+            chkAutoUpd.Location = new Point(506, 20); chkAutoUpd.Checked = true;
+            chkAutoUpd.CheckedChanged += delegate { if (!loadingInfo) RunAction("SetOption", "-Name update_mode -Value " + (chkAutoUpd.Checked ? "auto" : "ask"), null, true); };
+            gUpd.Controls.Add(chkAutoUpd);
+
             txtLog = new TextBox(); txtLog.Multiline = true; txtLog.ReadOnly = true; txtLog.ScrollBars = ScrollBars.Vertical;
-            txtLog.Location = new Point(12, 416); txtLog.Size = new Size(736, 172); txtLog.Font = new Font("Consolas", 8.5f);
+            txtLog.Location = new Point(12, 468); txtLog.Size = new Size(736, 170); txtLog.Font = new Font("Consolas", 8.5f);
             txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right; txtLog.BackColor = Color.White;
             Controls.Add(txtLog);
 
@@ -415,12 +481,40 @@ namespace DocHost
                 else if (tag == "PAIRCODE") lblPairCode.Text = "Code " + S(o, "code") + ": approve it in the browser that opened (or go to " + S(o, "uri") + ").";
                 else if (tag == "NEEDFORCE") pendingForce = o;
                 else if (tag == "SITEROM") { siteRom = S(o, "site"); UpdateNote(); }
+                else if (tag == "UPDATE") ShowUpdate(o, null);
                 return;
             }
             if (!quiet) Log("  " + line);
         }
 
         Dictionary<string, object> pendingForce;
+
+        // The update line: installed version and what the last check found. Notes are shown as plain text only.
+        void ShowUpdate(Dictionary<string, object> st, string installed)
+        {
+            string status = S(st, "status");
+            string inst = installed ?? S(st, "installed");
+            if (inst.Length > 0) updInstalled = inst; else inst = updInstalled;
+            updAvailable = status == "available" || status == "waiting" || status == "failed";
+            string t;
+            if (!updConfigured) t = "Version " + inst + ". Updates are not set up yet.";
+            else if (status == "available" || status == "waiting")
+            {
+                long bytes = 0; long.TryParse(S(st, "bytes"), out bytes);
+                t = "Update " + S(st, "version") + " ready (" + S(st, "files") + " file(s), " + (bytes / 1024 + 1) + " KB)"
+                    + (status == "waiting" ? ": waits, " + S(st, "why") : "");
+            }
+            else if (status == "updated") t = "Updated to " + inst + (S(st, "reopen") == "True" ? ". Reopen DOC Host to finish." : ".");
+            else if (status == "rolled_back") t = "Update " + S(st, "version") + " did not start cleanly: rolled back to " + inst + ".";
+            else if (status == "refused") t = "Update refused (failed the signature or safety checks).";
+            else if (status == "failed") t = "Update " + S(st, "version") + " failed here and was undone. Update now retries it.";
+            else if (status == "current") t = "Version " + inst + ". Up to date.";
+            else if (status == "off") t = "Version " + inst + ". Updates are off on this PC: " + S(st, "why") + ".";
+            else t = "Version " + inst + ". Not checked yet.";
+            if (updConfigured && updTask == "failed") t += " (Automatic checks could not be scheduled: reopen DOC Host to retry.)";
+            lblUpd.Text = t;
+            updTip.SetToolTip(lblUpd, S(st, "notes"));   // plain text; one tooltip, replaced each time
+        }
 
         static string S(Dictionary<string, object> o, string k)
         {
@@ -447,6 +541,15 @@ namespace DocHost
                         Dictionary<string, object> d = g as Dictionary<string, object>;
                         cmbGame.Items.Add(S(d, "key") + ") " + S(d, "name")); romKeys.Add(S(d, "rom"));
                     }
+                Dictionary<string, object> upd = o.ContainsKey("update") ? o["update"] as Dictionary<string, object> : null;
+                if (upd != null)
+                {
+                    updConfigured = S(upd, "configured") == "True";
+                    updTask = S(upd, "task");
+                    chkAutoUpd.Checked = S(upd, "mode") != "ask";
+                    Dictionary<string, object> ust = upd.ContainsKey("state") ? upd["state"] as Dictionary<string, object> : null;
+                    ShowUpdate(ust ?? new Dictionary<string, object>(), S(upd, "installed"));
+                }
                 Dictionary<string, object> st = o.ContainsKey("settings") ? o["settings"] as Dictionary<string, object> : null;
                 if (st != null)
                 {
@@ -557,6 +660,8 @@ namespace DocHost
             btnPair.Enabled = !b; btnStart.Enabled = !b && paired_; btnStop.Enabled = !b;
             btnFix.Enabled = !b && paired_; btnRestart.Enabled = !b && paired_; btnDoctor.Enabled = !b;
             cmbGame.Enabled = !b; numSeats.Enabled = !b; chkLocal.Enabled = !b; chkVideo.Enabled = !b;
+            btnCheckUpd.Enabled = !b && updConfigured && paired_; btnApplyUpd.Enabled = !b && updConfigured && paired_ && updAvailable;
+            chkAutoUpd.Enabled = updConfigured;
             btnStart.Text = (lastStatus != null && lastStatus.Flycast > 0) ? "Apply and restart" : "Start hosting";
         }
 
@@ -572,6 +677,18 @@ namespace DocHost
                     Status s = null;
                     try { s = ReadStatus(); } catch { }
                     if (s != null) Ui(delegate { ShowStatus(s); });
+                    try
+                    {
+                        // a background update (the 30-minute task) writes update-state.json: show it without a restart
+                        string sf = Path.Combine(P.DataDir, "updates", "update-state.json");
+                        if (File.Exists(sf) && File.GetLastWriteTimeUtc(sf) > updStateTime)
+                        {
+                            updStateTime = File.GetLastWriteTimeUtc(sf);
+                            Dictionary<string, object> us = Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(sf));
+                            if (us != null) Ui(delegate { ShowUpdate(us, null); });
+                        }
+                    }
+                    catch { }
                     for (int i = 0; i < 8 && !closing; i++) Thread.Sleep(500);
                 }
             });

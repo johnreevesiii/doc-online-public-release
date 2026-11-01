@@ -67,7 +67,7 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $MARKER_NAME = 'DOC Host data.json'
 # The only entries DOC Host ever deletes in the data folder ("Delete data"). Horses need a second yes.
 $OWN_ENTRIES = @('logs', 'settings.json', 'cabinet.json', 'recover-state.json', 'recover-status.json',
-                 'settings.json.tmp', 'recover-state.json.tmp', 'recover-status.json.tmp', $MARKER_NAME)
+                 'settings.json.tmp', 'recover-state.json.tmp', 'recover-status.json.tmp', 'updates', 'stop-requested.json', $MARKER_NAME)
 $HORSE_ENTRIES = @('pending_saves', 'backups', 'migrated')
 
 $script:logReady = $false
@@ -232,6 +232,15 @@ function Invoke-PostInstall {
   }
   $existed = Test-Path -LiteralPath $DataDir
   $nonEmpty = $existed -and [bool](@(Get-ChildItem -LiteralPath $DataDir -Force -ErrorAction SilentlyContinue).Count)
+  # A reinstall replaces every file: an update marker or journal left by an interrupted update no longer applies.
+  foreach ($n in @('in-progress.json', 'journal.jsonl')) { Remove-Item -LiteralPath (Join-Path $DataDir ('updates\' + $n)) -Force -ErrorAction SilentlyContinue }
+  # ... nor does its recovery copy (never run without its marker; removed so it cannot linger). A junction there is
+  # removed itself, never followed.
+  $rcv = Join-Path $DataDir 'updates\recovery'
+  if (Test-Path -LiteralPath $rcv) {
+    if ((Get-Item -LiteralPath $rcv -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { [IO.Directory]::Delete($rcv, $false) }
+    else { & cmd.exe /c rmdir /s /q "$rcv" 2>&1 | Out-Null }       # rmdir /s removes junctions without following them
+  }
   New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
   # Private from the first moment, before anything is written into it or any check below can stop here.
   if (-not (Lock-Folder $DataDir)) { [Console]::Out.WriteLine("PROBLEM: could not make $DataDir private to this account") ; $script:problems++ }
@@ -402,6 +411,18 @@ function Invoke-CfgMerge {
 # ---------------------------------------------------------------------------------------------------
 function Invoke-Uninstall {
   $script:logReady = (Test-Path -LiteralPath $DataDir) -and (Owned $DataDir)
+  # The 30-minute update check of THIS install (its action points into this install's hostapp folder). Removed
+  # first and without the pack's helpers, so a damaged pack never leaves it behind.
+  try {
+    $hs = [IO.Path]::GetFullPath($scripts).TrimEnd('\') + '\'
+    foreach ($t in @(Get-ScheduledTask -TaskName 'dochost_update_*' -ErrorAction SilentlyContinue)) {
+      $txt = ((@($t.Actions) | ForEach-Object { [string]$_.Arguments }) -join ' ')
+      if ($txt.IndexOf($hs, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false -ErrorAction Stop
+        Log ("update check task {0} removed" -f $t.TaskName)
+      }
+    }
+  } catch { Bad ("removing the update check task: {0}" -f $_.Exception.Message) }
   if (Test-Path -LiteralPath (Join-Path $pack 'setup\Common.ps1')) {
     # Stop this install (scoped) and drop ITS tasks (only tasks whose action points into this pack).
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'

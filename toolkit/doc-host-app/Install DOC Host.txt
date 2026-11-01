@@ -46,13 +46,13 @@ Click Install. Copying takes a minute or two.
 4. FIRST START
 --------------
 Open DOC Host (desktop or Start menu).
-  1. Sign in: press "Sign in and pair this PC". Your browser opens; sign in and approve the
-     cabinet. (Skip this if you moved over from a Host Pack folder: it says Paired.)
+  1. Sign in: press "Sign in and pair this PC". DOC Host shows a pairing code and opens the
+     pairing page in your browser; sign in and confirm the code. Your cabinet goes live straight
+     away. (Skip this if you moved over from a Host Pack folder: it says Paired.)
+     Each account hosts one cabinet: pairing a different PC moves it there.
   2. Pick the game and the number of seats. Tick "I will play at this PC too" if you want seat 1
-     for yourself.
-  3. On the website (Stable, Host section) set your cabinet's game version to the same game.
-     DOC Host reminds you if they differ.
-  4. Press Start hosting. Wait for the lights: Card broker, Game, Seat stations, Lobby link and
+     for yourself. The website follows the game DOC Host is running.
+  3. Press Start hosting. Wait for the lights: Card broker, Game, Seat stations, Lobby link and
      Video should go green within about two minutes.
 
 The lights
@@ -82,6 +82,7 @@ When a new version comes out:
   3. Run the new DOC-Host-Setup-<version>.exe (same "More info, Run anyway" step).
 It installs over the old version in the same folder. Your pairing, settings, logs and any unsaved
 horses are kept. Open DOC Host and press Start hosting.
+Versions older than 3.2.0 can't seat players any more, so update if you are on 3.1 or earlier.
 If setup says DOC Host is hosting right now, do step 1 first.
 
 
